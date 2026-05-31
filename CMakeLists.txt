@@ -33,7 +33,7 @@ if(VOXEL_BUILD_EXAMPLES)
     else()
         target_compile_options(voxel-demo PRIVATE -Wall -Wextra -O3 -march=native)
         target_compile_options(voxel-test PRIVATE -Wall -Wextra -O3 -march=native)
-        target_compile_options(voxel-jit-test PRIVATE -Wall -Wextra -O3 -march=native)
+        target_compile_options(voxel-jit-test PRIVATE -Wall -Wextra -Wno-free-nonheap-object -O3 -march=native)
     endif()
 endif()
 

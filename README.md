@@ -129,38 +129,53 @@ Utilities include bit manipulation (popcount, count-leading-zeros, bit reverse),
 
 ## Performance
 
-All measurements on an Intel x86-64 host, GCC 15.2, `-O3 -march=native`, 1,000,000 random f64 values in [0, 1000), threshold 500.0. Ground truth sum verified at 375,538,740.218.
+All measurements on an Intel x86-64 host, GCC 15.2, `-O3 -march=native`, 1,000,000 random f64 values in [0, 1000), threshold 500.0. Ground truth sum verified at 375,538,740.218. Results are the median of three runs; individual runs vary by roughly 10 percent due to thermal throttling and scheduler noise.
+
+### End-to-end filter and sum (1M rows)
+
+| Method | Time (us) | Throughput (M elem/s) | Overhead vs native |
+|--------|-----------|----------------------|---------------------|
+| Native C++ | 5,500 | 180 | baseline |
+| VoxelVM interpreter | 13,000 | 80 | 2.4x |
+| VoxelVM JIT | 74,000 | 13.5 | 13.5x |
+
+The interpreter runs at roughly 40 percent of native speed. For a bytecode VM dispatching 208 opcodes with bounds-checked segment access, vector registers, and typed bit-casts, that overhead is competitive. Most hobby VMs land between 10x and 50x slower than native for this class of workload.
+
+### JIT breakdown
+
+| Phase | Time (us) |
+|-------|-----------|
+| Compilation | 35 |
+| Execution | 74,000 |
+| **Total** | **74,035** |
+
+The JIT generates 252 bytes of correct x86-64 machine code in 35 microseconds. However, the generated code is slower than the interpreter. The reason is straightforward: the current JIT backend emits a direct, unoptimized translation of each bytecode instruction. Every operation loads its operands from the regfile pointer in memory, computes, and stores the result back. There is no register allocation pass, no liveness analysis, and no instruction scheduling. The VSUM horizontal reduction is emulated by storing the vector to the stack and loading each lane as a scalar, which produces 8 memory accesses for 4 additions.
+
+By contrast, the interpreter benefits from 1,300 lines of code all visible to the compiler inside a single translation unit. GCC unrolls the vector loops, keeps the accumulator in an xmm register, and eliminates redundant loads and stores across handler boundaries. The JIT cannot do any of this because the Compile method emits a fixed sequence of machine instructions per opcode with no cross-instruction analysis.
+
+Closing this gap requires a proper register allocator and a peephole pass that fuses adjacent load-compute-store sequences. That is planned but not yet implemented.
 
 ### Interpreter dispatch evolution
 
-The initial implementation used a 2,500-line switch statement. The current implementation uses a 256-entry function pointer table with 220 `VOXEL_ALWAYS_INLINE` leaf handlers. The switch approach compiled to a jump table but the compiler could not optimize across case boundaries. The function pointer table lets each handler be an independent compilation unit while still being inlined into the dispatch loop via LTO.
+The first implementation used a 2,500-line switch statement. The current implementation uses a 256-entry function pointer table with 220 `VOXEL_ALWAYS_INLINE` leaf handlers, each 4 to 15 lines. The switch compiled to a jump table but the compiler could not inline across case boundaries because the function was too large. The function pointer table lets each handler be an independent leaf that the compiler inlines at the call site inside `Run()`, producing a tight loop where the indirect branch is the only dispatch cost.
 
-| Dispatch method | Throughput | Improvement |
-|-----------------|------------|-------------|
-| Switch statement | 34.1 M elem/s | baseline |
-| Function pointer table | 62.3 M elem/s | +82.7% |
-| JIT (native x86-64) | instant (no measured overhead) | effectively native speed |
+| Dispatch method | Throughput (M elem/s) |
+|-----------------|----------------------|
+| Switch statement | 34 |
+| Function pointer table | 80 (+135%) |
 
-### Total pipeline latency (1M elements, filter > 500, sum)
-
-| Method | Time (us) | Throughput (M elem/s) | Notes |
-|--------|-----------|----------------------|-------|
-| Raw C++ scalar loop | 4,627 | 216 | Hand-written for loop, autovectorized |
-| VoxelVM interpreter | 16,059 | 62.3 | Full bytecode dispatch per 4-element vector |
-| VoxelVM JIT | single call | native | 252 bytes of x86-64, 11 AVX instructions |
-
-The interpreter overhead relative to raw C++ is 3.5x. This is the cost of bytecode dispatch plus the VLOAD memory indirection. The JIT eliminates both: it emits direct VMOVUPD from the segment pointer and keeps scalar accumulators in xmm registers across iterations. The 252 bytes of generated code contain no function calls and no indirect branches inside the loop body.
+Most of the gain comes from two effects: GCC can inline the leaf handlers but could not inline the switch cases, and the per-comparison-mode VFILTER dispatch eliminated the inner runtime switch that was causing branch mispredictions inside the hot loop.
 
 ### Subsystem-level measurements
 
 | Subsystem | Dataset | Time (us) | Notes |
 |-----------|---------|-----------|-------|
-| DictionaryEncoding build | 1M f64 | instant | Unique-value sort + index assignment |
-| NullBitmap | 1M rows, 0.1% null | instant | 156 u64 words, bitwise operations |
-| MergeSort (index) | 1M f64 | 144,427 | 144 ms for 1M element index sort |
+| DictionaryEncoding build | 1M f64 | instant | Unique-value sort, index assignment |
+| NullBitmap | 1M rows, 0.1% null | instant | 156 u64 words, bitwise ops |
+| MergeSort (index) | 1M f64 | 144,000 | 144 ms, index-only sort |
 | HashAggregator | 1,000 rows, 10 groups | 9 | Open addressing, 10 distinct keys |
-| RLEEncoding build | 1M f64 | instant | Run-length detection, single scan |
-| VectorFilter bitmap | 1M f64 | instant | 256-chunk processing, hardware popcount |
+| RLEEncoding build | 1M f64 | instant | Single-scan run detection |
+| VectorFilter bitmap | 1M f64 | instant | 256-chunk processing, HW popcount |
 
 ## Compiler requirements
 
