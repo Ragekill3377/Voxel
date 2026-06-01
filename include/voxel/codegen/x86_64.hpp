@@ -1205,6 +1205,140 @@ public:
         // Map bytecode index → code offset for branch resolution
         std::unordered_map<sz, sz> bcToCode;
 
+        // ----------------------------------------------------------------
+        // Register allocator: pre-scan bytecode to identify hot scalars
+        // and assign dedicated host GPRs (avoids regfile roundtrips)
+        // ----------------------------------------------------------------
+        constexpr u8 REG_NONE = 0xFF;
+        static constexpr u8 kAllocGprs[] = {
+            static_cast<u8>(Reg64::RBX),
+            static_cast<u8>(Reg64::R8),  static_cast<u8>(Reg64::R9),
+            static_cast<u8>(Reg64::R10), static_cast<u8>(Reg64::R11),
+        };
+        static constexpr sz kNumAllocGprs = sizeof(kAllocGprs) / sizeof(kAllocGprs[0]);
+
+        u32 scalarUse[64] = {};
+        for (sz i = 0; i < bytecodeSize; ++i) {
+            u32 raw = bytecode[i];
+            u8 rd = (raw >> 8) & 0xF;
+            u8 ra = (raw >> 12) & 0xF;
+            u8 rb = (raw >> 16) & 0xF;
+            scalarUse[rd]++; scalarUse[ra]++; scalarUse[rb]++;
+        }
+
+        u8 scalarHost[64];
+        bool scalarDirty[64] = {};
+        for (sz i = 0; i < 64; ++i) scalarHost[i] = REG_NONE;
+
+        u8 vectorHost[16];
+        bool vectorDirty[16] = {};
+        for (sz i = 0; i < 16; ++i) vectorHost[i] = REG_NONE;
+
+        // Liveness: is a VM register read again before its next write?
+        // scanned forward from each instruction position
+        auto isDeadScalar = [&](u8 vreg, sz fromIdx) -> bool {
+            for (sz i = fromIdx + 1; i < bytecodeSize; ++i) {
+                u32 r2 = bytecode[i];
+                u8 op2 = r2 & 0xFF;
+                u8 rd2 = (r2 >> 8) & 0xF;
+                u8 ra2 = (r2 >> 12) & 0xF;
+                u8 rb2 = (r2 >> 16) & 0xF;
+                if (op2 == static_cast<u8>(Opcode::JMP) || op2 == static_cast<u8>(Opcode::JZ) ||
+                    op2 == static_cast<u8>(Opcode::JNZ) || op2 == static_cast<u8>(Opcode::HALT) ||
+                    op2 == static_cast<u8>(Opcode::RET) || op2 == static_cast<u8>(Opcode::CALL))
+                    return true; // branch: conservatively assume dead after branch
+                if (rd2 == vreg) return true; // overwritten before read → dead
+                if (ra2 == vreg || rb2 == vreg) return false; // read before overwrite → live
+            }
+            return true; // end of code → dead
+        };
+        auto isDeadVector = [&](u8 vreg, sz fromIdx) -> bool {
+            for (sz i = fromIdx + 1; i < bytecodeSize; ++i) {
+                u32 r2 = bytecode[i];
+                u8 op2 = r2 & 0xFF;
+                u8 rd2 = (r2 >> 8) & 0xF;
+                u8 ra2 = (r2 >> 12) & 0xF;
+                u8 rb2 = (r2 >> 16) & 0xF;
+                if (op2 == static_cast<u8>(Opcode::JMP) || op2 == static_cast<u8>(Opcode::JZ) ||
+                    op2 == static_cast<u8>(Opcode::JNZ) || op2 == static_cast<u8>(Opcode::HALT) ||
+                    op2 == static_cast<u8>(Opcode::RET) || op2 == static_cast<u8>(Opcode::CALL))
+                    return true;
+                if (rd2 == vreg) return true;
+                if (ra2 == vreg || rb2 == vreg) return false;
+            }
+            return true;
+        };
+        u8 nextGpr = 0;
+        for (sz round = 0; round < 64 && nextGpr < kNumAllocGprs; ++round) {
+            u32 best = 0; sz bestIdx = 0;
+            for (sz r = 0; r < 64; ++r) {
+                if (scalarHost[r] == REG_NONE && scalarUse[r] > best) { best = scalarUse[r]; bestIdx = r; }
+            }
+            if (best == 0) break;
+            scalarHost[bestIdx] = kAllocGprs[nextGpr];
+            scalarUse[bestIdx] = 0;
+            ++nextGpr;
+        }
+
+        auto loadScalarReg = [&](u8 vreg, u8 fbGpr) {
+            u8 h = scalarHost[vreg];
+            if (h != REG_NONE) {
+                if (h != fbGpr) a.MovRegReg(fbGpr, h);
+            } else {
+                i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
+                a.MovRegMem(fbGpr, static_cast<u8>(Reg64::R14), off);
+            }
+        };
+        auto storeScalarReg = [&](u8 vreg, u8 valGpr) {
+            u8 h = scalarHost[vreg];
+            if (h != REG_NONE) {
+                if (h != valGpr) a.MovRegReg(h, valGpr);
+            } else {
+                i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
+                a.MovMemReg(static_cast<u8>(Reg64::R14), off, valGpr);
+            }
+        };
+        auto loadVectorReg = [&](u8 vreg, u8 ymmreg) {
+            if (vectorHost[ymmreg] == vreg) return;
+            if (vectorHost[ymmreg] != REG_NONE && vectorDirty[vectorHost[ymmreg]]) {
+                i32 off2 = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vectorHost[ymmreg]) * kVectorStride);
+                a.VmovupdMemYmm(static_cast<u8>(Reg64::R14), off2, ymmreg);
+                vectorDirty[vectorHost[ymmreg]] = false;
+            }
+            i32 off = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vreg) * kVectorStride);
+            a.VmovupdYmmMem(ymmreg, static_cast<u8>(Reg64::R14), off);
+            vectorHost[ymmreg] = vreg;
+            vectorDirty[vreg] = false;
+        };
+        auto storeVectorReg = [&](u8 vreg, u8 ymmreg, sz bcIdx) {
+            vectorHost[ymmreg] = vreg;
+            if (isDeadVector(vreg, bcIdx)) {
+                vectorDirty[vreg] = true;
+            } else {
+                i32 off = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vreg) * kVectorStride);
+                a.VmovupdMemYmm(static_cast<u8>(Reg64::R14), off, ymmreg);
+                vectorDirty[vreg] = false;
+            }
+        };
+        auto flushScalars = [&]() {
+            for (sz i = 0; i < 64; ++i) {
+                u8 h = scalarHost[i];
+                if (h != REG_NONE) {
+                    i32 off = static_cast<i32>(kScalarRegOffset + i * 8);
+                    a.MovMemReg(static_cast<u8>(Reg64::R14), off, h);
+                }
+            }
+        };
+
+        // Pre-load assigned host GPRs from regfile
+        for (sz i = 0; i < 64; ++i) {
+            u8 h = scalarHost[i];
+            if (h != REG_NONE) {
+                i32 off = static_cast<i32>(kScalarRegOffset + i * 8);
+                a.MovRegMem(h, static_cast<u8>(Reg64::R14), off);
+            }
+        }
+
         sz bcIdx = 0;
         while (bcIdx < bytecodeSize) {
             bcToCode[bcIdx] = a.CurrentOffset;
@@ -1214,23 +1348,6 @@ public:
             u8  ra  = static_cast<u8>((raw >> 12) & 0xF);
             u8  rb  = static_cast<u8>((raw >> 16) & 0xF);
             u16 imm12 = static_cast<u16>((raw >> 20) & 0xFFF);
-
-            auto loadScalarReg = [&](u8 vreg, u8 hostreg) {
-                i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
-                a.MovRegMem(hostreg, static_cast<u8>(Reg64::R14), off);
-            };
-            auto storeScalarReg = [&](u8 vreg, u8 hostreg) {
-                i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
-                a.MovMemReg(static_cast<u8>(Reg64::R14), off, hostreg);
-            };
-            auto loadVectorReg = [&](u8 vreg, u8 ymmreg) {
-                i32 off = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vreg) * kVectorStride);
-                a.VmovupdYmmMem(ymmreg, static_cast<u8>(Reg64::R14), off);
-            };
-            auto storeVectorReg = [&](u8 vreg, u8 ymmreg) {
-                i32 off = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vreg) * kVectorStride);
-                a.VmovupdMemYmm(static_cast<u8>(Reg64::R14), off, ymmreg);
-            };
             auto immAsRel = [](u16 imm12) -> i32 {
                 if (imm12 & 0x800) return static_cast<i32>(static_cast<i16>(imm12 | 0xF000));
                 return static_cast<i32>(imm12);
@@ -1463,11 +1580,11 @@ public:
                     a.AddRegReg(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::RAX));
 
                     a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R15), 0);
-                    storeVectorReg(rd, 0);
+                    storeVectorReg(rd, 0, bcIdx);
 
                     if (count > 4) {
                         a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R15), 32);
-                        storeVectorReg(static_cast<u8>(rd + 1), 1);
+                        storeVectorReg(static_cast<u8>(rd + 1), 1, bcIdx);
                     }
                     ++bcIdx;
                 }
@@ -1505,7 +1622,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vaddpd(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1513,7 +1630,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vsubpd(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1521,7 +1638,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vmulpd(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1529,7 +1646,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vdivpd(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1537,7 +1654,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vminpd(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1545,7 +1662,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vmaxpd(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1567,7 +1684,7 @@ public:
 
                     a.Vcmppd(2, 0, 1, pred);
                     a.Vpand(0, 0, 2);
-                    storeVectorReg(rd, 0);
+                    storeVectorReg(rd, 0, bcIdx);
                     ++bcIdx;
                 }
                 break;
@@ -1580,7 +1697,7 @@ public:
                 a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 0);
                 a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1592,7 +1709,7 @@ public:
                 a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 4);
                 a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1604,7 +1721,7 @@ public:
                 a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 1);
                 a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1616,7 +1733,7 @@ public:
                 a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 2);
                 a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1628,7 +1745,7 @@ public:
                 a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 14);
                 a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1640,7 +1757,7 @@ public:
                 a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 13);
                 a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1649,7 +1766,7 @@ public:
                 loadVectorReg(rb, 1);
                 loadVectorReg(0, 2); // use mask from vector 0 → actually need proper mask setup
                 a.Vblendvpd(0, 0, 1, 2);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1725,7 +1842,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vpand(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1733,7 +1850,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vpor(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1741,7 +1858,7 @@ public:
                 loadVectorReg(ra, 0);
                 loadVectorReg(rb, 1);
                 a.Vpxor(0, 0, 1);
-                storeVectorReg(rd, 0);
+                storeVectorReg(rd, 0, bcIdx);
                 ++bcIdx;
                 break;
 
@@ -1797,6 +1914,7 @@ public:
         // Resolve branch patches
         // ------------------------------------------------------------
     doneTranslating:
+        flushScalars();
         for (auto& p : patches) {
             auto it = bcToCode.find(p.bcIndex);
             if (it != bcToCode.end()) {
