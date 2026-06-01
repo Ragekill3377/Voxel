@@ -1229,6 +1229,8 @@ public:
             static_cast<u8>(Reg64::RBX),
             static_cast<u8>(Reg64::R8),  static_cast<u8>(Reg64::R9),
             static_cast<u8>(Reg64::R10), static_cast<u8>(Reg64::R11),
+            static_cast<u8>(Reg64::RDI), static_cast<u8>(Reg64::RSI),
+            static_cast<u8>(Reg64::RDX),
         };
         static constexpr sz kNumAllocGprs = sizeof(kAllocGprs) / sizeof(kAllocGprs[0]);
 
