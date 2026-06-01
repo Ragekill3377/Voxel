@@ -638,6 +638,18 @@ public:
         EmitModRM(3, dst & 7, b & 7);
     }
 
+    void Vaddpd128(u8 dst, u8 a, u8 b)
+    {
+        bool re = (dst < 8), be = (b < 8);
+        if (!re || !be) {
+            EmitVEX3(1, 0, a, re, true, be, 1);
+        } else {
+            EmitVEX2(1, 0, a, re);
+        }
+        EmitByte(0x58);
+        EmitModRM(3, dst & 7, b & 7);
+    }
+
     void Vsubpd(u8 dst, u8 a, u8 b)
     {
         bool re = (dst < 8), be = (b < 8);
@@ -1229,8 +1241,6 @@ public:
             static_cast<u8>(Reg64::RBX),
             static_cast<u8>(Reg64::R8),  static_cast<u8>(Reg64::R9),
             static_cast<u8>(Reg64::R10), static_cast<u8>(Reg64::R11),
-            static_cast<u8>(Reg64::RDI), static_cast<u8>(Reg64::RSI),
-            static_cast<u8>(Reg64::RDX),
         };
         static constexpr sz kNumAllocGprs = sizeof(kAllocGprs) / sizeof(kAllocGprs[0]);
 
@@ -1654,15 +1664,8 @@ public:
                     a.MovRegMem(static_cast<u8>(Reg64::R15),
                                 static_cast<u8>(Reg64::R13),
                                 static_cast<i32>(static_cast<sz>(segId) * 8));
-                    u8 hra2 = scalarHost[ra];
-                    if (hra2 != REG_NONE) {
-                        if (hra2 != static_cast<u8>(Reg64::RAX)) a.MovRegReg(static_cast<u8>(Reg64::RAX), hra2);
-                        a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
-                    } else {
-                        i32 off2 = static_cast<i32>(kScalarRegOffset + static_cast<sz>(ra) * 8);
-                        a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off2);
-                        a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
-                    }
+                    loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
+                    a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
                     a.AddRegReg(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::RAX));
 
                     loadVectorReg(rd, 0);
@@ -1736,11 +1739,10 @@ public:
                 {
                     u8 mode = imm12 & 0x7;
                     loadVectorReg(ra, 0);
-                    {
-                        i32 threshOff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(rb) * 8);
-                        a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), threshOff);
-                        a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                    }
+                    loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
+                    a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
+                    a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
+                    a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
 
                     static const u8 cmpMap[6] = {0, 4, 1, 2, 14, 13};
                     u8 pred = (mode < 6) ? cmpMap[mode] : 0;
@@ -1802,11 +1804,10 @@ public:
 
             case Opcode::VFILTER_GT:
                 loadVectorReg(ra, 0);
-                {
-                    i32 threshOff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(rb) * 8);
-                    a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), threshOff);
-                    a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                }
+                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
+                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
+                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
+                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 14);
                 a.Vpand(0, 0, 2);
                 storeVectorReg(rd, 0, bcIdx);
@@ -1815,11 +1816,10 @@ public:
 
             case Opcode::VFILTER_GE:
                 loadVectorReg(ra, 0);
-                {
-                    i32 threshOff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(rb) * 8);
-                    a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), threshOff);
-                    a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                }
+                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
+                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
+                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
+                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
                 a.Vcmppd(2, 0, 1, 13);
                 a.Vpand(0, 0, 2);
                 storeVectorReg(rd, 0, bcIdx);
@@ -1841,17 +1841,16 @@ public:
 
             case Opcode::VSUM:
                 loadVectorReg(ra, 0);
-                a.Vextractf128(1, 0, 1);
-                a.Vaddpd(0, 0, 1);
-                a.Vmovhlps(1, 0, 0);
+                a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
+                a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
+                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
+                a.Vaddsd(0, 0, 1);
+                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
+                a.Vaddsd(0, 0, 1);
+                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
                 a.Vaddsd(0, 0, 1);
                 a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
-                if (scalarHost[rd] != REG_NONE)
-                    a.MovRegReg(scalarHost[rd], static_cast<u8>(Reg64::RAX));
-                else {
-                    i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(rd) * 8);
-                    a.MovMemReg(static_cast<u8>(Reg64::R14), off, static_cast<u8>(Reg64::RAX));
-                }
+                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
                 ++bcIdx;
                 break;
 
