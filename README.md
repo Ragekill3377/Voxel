@@ -11,8 +11,8 @@ The catch is that most bytecode VMs are either toys that handle six opcodes and 
 ## Quick start
 
 ```sh
-git clone https://github.com/user/voxelvm
-cd voxelvm
+git clone https://github.com/Ragekill3377/Voxel
+cd Voxel
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ./build/voxel-demo       # performance benchmarks with ground-truth checks
