@@ -249,7 +249,13 @@ public:
     u64 Hash() const {
         u64 h = static_cast<u64>(Count);
         for (sz i = 0; i < Count; ++i) {
-            u64 v = std::bit_cast<u64>(Data[i]);
+            u64 v;
+            if constexpr (sizeof(T) >= sizeof(u64))
+                v = std::bit_cast<u64>(Data[i]);
+            else if constexpr (sizeof(T) >= sizeof(u32))
+                v = static_cast<u64>(std::bit_cast<u32>(Data[i]));
+            else
+                v = static_cast<u64>(static_cast<u8>(Data[i]));
             h = ((h << 7) | (h >> 57)) ^ (v * 0x9E3779B97F4A7C15ULL);
         }
         return h;

@@ -331,7 +331,7 @@ private:
         return Result();
     }
 
-    Result VerifyDivisionByZero(Opcode op, Instruction, sz pc) {
+    Result VerifyDivisionByZero(Opcode op, const Instruction&, sz pc) {
         switch (op) {
         case Opcode::DIV:  case Opcode::DIVF: case Opcode::MOD:
         case Opcode::VDIV: case Opcode::VMOD:

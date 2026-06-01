@@ -34,6 +34,7 @@
 
 // Execution
 #include "voxel/exec/engine.hpp"
+#include "voxel/exec/optimizer.hpp"
 
 // JIT Codegen (platform-specific)
 #include "voxel/codegen/jit.hpp"

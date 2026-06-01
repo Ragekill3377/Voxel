@@ -2,8 +2,6 @@
 
 #include "voxel/core/types.hpp"
 #include "voxel/core/platform.hpp"
-#include "voxel/core/types.hpp"
-#include "voxel/core/platform.hpp"
 #include "voxel/data/segment.hpp"
 #include "voxel/bytecode/opcodes.hpp"
 #include "voxel/ops/hash.hpp"
