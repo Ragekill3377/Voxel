@@ -1841,9 +1841,13 @@ public:
 
             case Opcode::VSUM:
                 loadVectorReg(ra, 0);
-                a.VmovapdYmmYmm(1, 0);
-                a.Vhaddpd(0, 0, 1);
-                a.Vperm2f128(1, 0, 0, 1);
+                a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
+                a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
+                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
+                a.Vaddsd(0, 0, 1);
+                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
+                a.Vaddsd(0, 0, 1);
+                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
                 a.Vaddsd(0, 0, 1);
                 a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
                 storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
