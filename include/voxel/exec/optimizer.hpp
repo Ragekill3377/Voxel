@@ -207,8 +207,6 @@ public:
                 }
                 break;
             }
-            default:
-                break;
             case Opcode::ANDI: {
                 auto it = constants.find(ra);
                 if (it != constants.end()) {
@@ -385,9 +383,8 @@ public:
         // Rd without Rd being read in between)
         for (sz i = 1; i < codeSize; ++i) {
             u32 raw = code[i];
-            Opcode op = ExtractOp(raw);
             u8 rd = ExtractRd(raw);
-            u8 preOp = ExtractOp(code[i - 1]);
+            Opcode preOp = ExtractOp(code[i - 1]);
             u8 preRd = ExtractRd(code[i - 1]);
 
             if (preOp == Opcode::MOV && preRd == rd) {
@@ -443,99 +440,6 @@ public:
         sz codeSize = code.size();
         (void)pc;
 
-        // First scan: find last writer and next reader for each register at each PC
-        // lastWriter[reg] = position of last write
-        // readingInsts[pc] = set of regs read at that PC
-        std::unordered_map<u8, sz> lastWriter;
-        std::vector<std::vector<u8>> readsAt(codeSize);
-        std::vector<std::vector<u8>> writesAt(codeSize);
-        std::vector<sz> nextRead(16, codeSize);
-        std::vector<sz> nextWrite(16, codeSize);
-
-        for (sz i = 0; i < codeSize; ++i) {
-            u32 raw = code[i];
-            Opcode op = ExtractOp(raw);
-            u8 rd = ExtractRd(raw);
-            u8 ra = ExtractRa(raw);
-            u8 rb = ExtractRb(raw);
-
-            // Track reads
-            if (ra < 16) readsAt[i].push_back(ra);
-            if (rb < 16 && rb != ra) readsAt[i].push_back(rb);
-
-            // Track writes (destination)
-            bool writesReg = false;
-            switch (op) {
-            case Opcode::MOV: case Opcode::MOVR: case Opcode::ADDI: case Opcode::SUBI:
-            case Opcode::MULI: case Opcode::ANDI: case Opcode::ORI: case Opcode::XORI:
-            case Opcode::SHLI: case Opcode::SHRI: case Opcode::SAR_I:
-            case Opcode::MOVZ: case Opcode::MOVN: case Opcode::MOVK: case Opcode::LEA:
-            case Opcode::ADD:  case Opcode::SUB:  case Opcode::MUL:  case Opcode::DIV:
-            case Opcode::MOD:  case Opcode::NEG:  case Opcode::ABS:  case Opcode::MIN:
-            case Opcode::MAX:  case Opcode::AVG:  case Opcode::ADDF: case Opcode::SUBF:
-            case Opcode::MULF: case Opcode::DIVF: case Opcode::NEGF: case Opcode::ABSF:
-            case Opcode::AND:  case Opcode::OR:   case Opcode::XOR:  case Opcode::NOT:
-            case Opcode::SHL:  case Opcode::SHR:  case Opcode::SAR:  case Opcode::ROL:
-            case Opcode::ROR:  case Opcode::POPCNT: case Opcode::CLZ: case Opcode::CTZ:
-            case Opcode::BSWAP: case Opcode::BEXTR: case Opcode::BZHI: case Opcode::PDEP:
-            case Opcode::ISNULL: case Opcode::ISNOTNULL: case Opcode::SELECT: case Opcode::SELECTV:
-            case Opcode::CVT_I8: case Opcode::CVT_I16: case Opcode::CVT_I32: case Opcode::CVT_I64:
-            case Opcode::CVT_F32: case Opcode::CVT_F64: case Opcode::CVT_U8: case Opcode::CVT_U16:
-            case Opcode::CVT_U32: case Opcode::CVT_U64: case Opcode::BITCAST: case Opcode::REINTERPRET:
-            case Opcode::TRUNC: case Opcode::ROUND: case Opcode::CEIL: case Opcode::FLOOR:
-            case Opcode::VEXTRACT: case Opcode::VSUM: case Opcode::VPROD: case Opcode::VMEAN:
-            case Opcode::VSTDDEV: case Opcode::VVARIANCE: case Opcode::VRED_MIN: case Opcode::VRED_MAX:
-            case Opcode::VCOUNT: case Opcode::VANY: case Opcode::VALL: case Opcode::VFIRST:
-            case Opcode::VLAST: case Opcode::VNTH:
-            case Opcode::AGG_COUNT: case Opcode::AGG_SUM: case Opcode::AGG_AVG:
-            case Opcode::AGG_MIN: case Opcode::AGG_MAX: case Opcode::AGG_FIRST: case Opcode::AGG_LAST:
-            case Opcode::AGG_STDDEV: case Opcode::AGG_VARIANCE: case Opcode::AGG_COUNT_DISTINCT:
-            case Opcode::AGG_SUM_DISTINCT: case Opcode::AGG_MEDIAN: case Opcode::AGG_MODE:
-            case Opcode::AGG_PERCENTILE: case Opcode::HASH_INIT: case Opcode::HASH_PROBE:
-            case Opcode::HASH_BUILD: case Opcode::HASH_LOOKUP: case Opcode::SORT_ASC:
-            case Opcode::SORT_DESC: case Opcode::SORT_TOPK: case Opcode::SORT_BOTTOMK:
-            case Opcode::JOIN_HASH: case Opcode::JOIN_MERGE: case Opcode::JOIN_NESTED:
-            case Opcode::JOIN_ANTI: case Opcode::JOIN_SEMI: case Opcode::WINDOW_ROW:
-            case Opcode::WINDOW_RANGE: case Opcode::PARTITION_HASH:
-            case Opcode::SERIALIZE: case Opcode::DESERIALIZE:
-                writesReg = true;
-                break;
-            default:
-                break;
-            }
-            if (writesReg) {
-                writesAt[i].push_back(rd);
-                lastWriter[rd] = i;
-            }
-        }
-
-        // Scan backwards to find next reader for each register at each position
-        std::vector<sz> nextReader(16, codeSize);
-        for (isz i = static_cast<isz>(codeSize) - 1; i >= 0; --i) {
-            u32 raw = code[static_cast<sz>(i)];
-            u8 rd = ExtractRd(raw);
-            u8 ra = ExtractRa(raw);
-            u8 rb = ExtractRb(raw);
-
-            bool isControl = IsBranchOrRet(ExtractOp(raw)) || Terminates(ExtractOp(raw));
-
-            for (u8 r : readsAt[static_cast<sz>(i)]) {
-                nextReader[r] = static_cast<sz>(i);
-            }
-
-            if (ExtractOp(raw) == Opcode::MOV) {
-                nextReader[rd] = codeSize; // MOV to rd with a constant read doesn't count as a "read-after-write"
-            }
-
-            if (isControl) {
-                // At control flow boundaries, conservatively mark all regs as read
-                for (sz r = 0; r < 16; ++r) {
-                    nextReader[r] = static_cast<sz>(i);
-                }
-            }
-        }
-
-        // Second pass forward: check if a write is dead
         for (sz i = 0; i < codeSize; ++i) {
             u32 raw = code[i];
             Opcode op = ExtractOp(raw);
@@ -546,89 +450,20 @@ public:
             if (Terminates(op)) continue;
             if (op == Opcode::TRAP || op == Opcode::BREAK) continue;
 
-            bool writesReg = false;
-            switch (op) {
-            case Opcode::MOV: case Opcode::MOVR: case Opcode::ADDI: case Opcode::SUBI:
-            case Opcode::MULI: case Opcode::ANDI: case Opcode::ORI: case Opcode::XORI:
-            case Opcode::SHLI: case Opcode::SHRI: case Opcode::SAR_I:
-            case Opcode::MOVZ: case Opcode::MOVN: case Opcode::MOVK: case Opcode::LEA:
-            case Opcode::ADD:  case Opcode::SUB:  case Opcode::MUL:  case Opcode::DIV:
-            case Opcode::MOD:  case Opcode::NEG:  case Opcode::ABS:  case Opcode::MIN:
-            case Opcode::MAX:  case Opcode::AVG:  case Opcode::ADDF: case Opcode::SUBF:
-            case Opcode::MULF: case Opcode::DIVF: case Opcode::NEGF: case Opcode::ABSF:
-            case Opcode::AND:  case Opcode::OR:   case Opcode::XOR:  case Opcode::NOT:
-            case Opcode::SHL:  case Opcode::SHR:  case Opcode::SAR:  case Opcode::ROL:
-            case Opcode::ROR:  case Opcode::POPCNT: case Opcode::CLZ: case Opcode::CTZ:
-            case Opcode::BSWAP: case Opcode::BEXTR: case Opcode::BZHI: case Opcode::PDEP:
-            case Opcode::ISNULL: case Opcode::ISNOTNULL:
-            case Opcode::CVT_I8: case Opcode::CVT_I16: case Opcode::CVT_I32: case Opcode::CVT_I64:
-            case Opcode::CVT_F32: case Opcode::CVT_F64: case Opcode::CVT_U8: case Opcode::CVT_U16:
-            case Opcode::CVT_U32: case Opcode::CVT_U64: case Opcode::BITCAST: case Opcode::REINTERPRET:
-            case Opcode::TRUNC: case Opcode::ROUND: case Opcode::CEIL: case Opcode::FLOOR:
-            case Opcode::VEXTRACT: case Opcode::VCOUNT: case Opcode::VANY: case Opcode::VALL:
-            case Opcode::VFIRST: case Opcode::VLAST: case Opcode::VNTH:
-            case Opcode::POPCNT: case Opcode::CLZ: case Opcode::CTZ: case Opcode::BSWAP: case Opcode::PDEP:
-                writesReg = true;
-                break;
-            default:
-                break;
-            }
+            if (!WritesDestReg(op)) continue;
 
-            if (!writesReg) continue;
-
-            // Find next write to rd
             sz nextWr = codeSize;
             for (sz j = i + 1; j < codeSize; ++j) {
                 u32 fwd = code[j];
                 if (IsNop(fwd)) continue;
                 u8 fRd = ExtractRd(fwd);
                 Opcode fOp = ExtractOp(fwd);
-                bool fWrites = false;
-                switch (fOp) {
-                case Opcode::MOV: case Opcode::MOVR: case Opcode::ADDI: case Opcode::SUBI:
-                case Opcode::MULI: case Opcode::ANDI: case Opcode::ORI: case Opcode::XORI:
-                case Opcode::SHLI: case Opcode::SHRI: case Opcode::SAR_I:
-                case Opcode::ADD: case Opcode::SUB: case Opcode::MUL: case Opcode::DIV:
-                case Opcode::MOD: case Opcode::NEG: case Opcode::ABS: case Opcode::MIN:
-                case Opcode::MAX: case Opcode::AVG:
-                case Opcode::ADDF: case Opcode::SUBF: case Opcode::MULF: case Opcode::DIVF:
-                case Opcode::NEGF: case Opcode::ABSF:
-                case Opcode::AND: case Opcode::OR: case Opcode::XOR: case Opcode::NOT:
-                case Opcode::SHL: case Opcode::SHR: case Opcode::SAR: case Opcode::ROL:
-                case Opcode::ROR: case Opcode::POPCNT: case Opcode::CLZ: case Opcode::CTZ:
-                case Opcode::BSWAP: case Opcode::BEXTR: case Opcode::BZHI: case Opcode::PDEP:
-                case Opcode::MOVZ: case Opcode::MOVN: case Opcode::MOVK: case Opcode::LEA:
-                case Opcode::ISNULL: case Opcode::ISNOTNULL:
-                case Opcode::CVT_I8: case Opcode::CVT_I16: case Opcode::CVT_I32: case Opcode::CVT_I64:
-                case Opcode::CVT_F32: case Opcode::CVT_F64: case Opcode::CVT_U8: case Opcode::CVT_U16:
-                case Opcode::CVT_U32: case Opcode::CVT_U64: case Opcode::BITCAST: case Opcode::REINTERPRET:
-                case Opcode::TRUNC: case Opcode::ROUND: case Opcode::CEIL: case Opcode::FLOOR:
-                case Opcode::VEXTRACT: case Opcode::VCOUNT: case Opcode::VANY: case Opcode::VALL:
-                case Opcode::VFIRST: case Opcode::VLAST: case Opcode::VNTH:
-                case Opcode::SELECT: case Opcode::SELECTV:
-                case Opcode::VSUM: case Opcode::VPROD: case Opcode::VMEAN:
-                case Opcode::VSTDDEV: case Opcode::VVARIANCE: case Opcode::VRED_MIN: case Opcode::VRED_MAX:
-                case Opcode::AGG_COUNT: case Opcode::AGG_SUM: case Opcode::AGG_AVG:
-                case Opcode::AGG_MIN: case Opcode::AGG_MAX: case Opcode::AGG_FIRST: case Opcode::AGG_LAST:
-                case Opcode::AGG_STDDEV: case Opcode::AGG_VARIANCE: case Opcode::AGG_COUNT_DISTINCT:
-                case Opcode::AGG_SUM_DISTINCT: case Opcode::AGG_MEDIAN: case Opcode::AGG_MODE:
-                case Opcode::AGG_PERCENTILE: case Opcode::HASH_INIT: case Opcode::HASH_PROBE:
-                case Opcode::HASH_BUILD: case Opcode::HASH_LOOKUP: case Opcode::SORT_ASC:
-                case Opcode::SORT_DESC: case Opcode::SORT_TOPK: case Opcode::SORT_BOTTOMK:
-                case Opcode::JOIN_HASH: case Opcode::JOIN_MERGE: case Opcode::JOIN_NESTED:
-                case Opcode::JOIN_ANTI: case Opcode::JOIN_SEMI: case Opcode::WINDOW_ROW:
-                case Opcode::WINDOW_RANGE: case Opcode::PARTITION_HASH:
-                case Opcode::SERIALIZE: case Opcode::DESERIALIZE:
-                    fWrites = true;
-                    break;
-                default: break;
-                }
-                if (fWrites && fRd == rd) { nextWr = j; break; }
 
-                // Check if rd is read by instruction at j
+                if (WritesDestReg(fOp) && fRd == rd) { nextWr = j; break; }
+
                 u8 fRa = ExtractRa(fwd);
                 u8 fRb = ExtractRb(fwd);
-                if (fRa == rd || fRb == rd) { nextWr = codeSize + 1; break; } // read before next write, not dead
+                if (fRa == rd || fRb == rd) { nextWr = codeSize + 1; break; }
 
                 if (IsBranchOrRet(fOp) || Terminates(fOp)) break;
             }
@@ -647,6 +482,20 @@ public:
 
 private:
     sz ChangedCount_ = 0;
+
+    static bool WritesDestReg(Opcode op) {
+        u8 v = static_cast<u8>(op);
+        return v != 0x00 && v != 0x01 && v != 0x02 && v != 0x03
+            && v != 0x04 && v != 0x05 && v != 0x06 && v != 0x07
+            && v != 0x08 && v != 0x09
+            && op != Opcode::CMP && op != Opcode::CMPF
+            && op != Opcode::CMPU && op != Opcode::TST && op != Opcode::TSTF
+            && op != Opcode::JMP && op != Opcode::RET && op != Opcode::TABLE_JMP
+            && op != Opcode::TRAP && op != Opcode::BREAK
+            && op != Opcode::YIELD && op != Opcode::BARRIER
+            && op != Opcode::PREFETCH && op != Opcode::FLUSH_CACHE
+            && op != Opcode::SYNC && op != Opcode::MEMFENCE;
+    }
 };
 
 // ============================================================================
@@ -818,7 +667,6 @@ public:
 
                     if (currentInvariant.find(rd) != currentInvariant.end()) continue;
 
-                    bool usesRegs = false;
                     bool allInvariant = true;
 
                     switch (op) {
@@ -827,7 +675,6 @@ public:
                         break;
                     case Opcode::MOVR:
                     case Opcode::VSPLAT: {
-                        usesRegs = true;
                         if (currentInvariant.find(ra) == currentInvariant.end())
                             allInvariant = false;
                         break;
@@ -837,7 +684,6 @@ public:
                     case Opcode::BSWAP:
                     case Opcode::BITCAST: case Opcode::REINTERPRET:
                     case Opcode::TRUNC: case Opcode::ROUND: case Opcode::CEIL: case Opcode::FLOOR: {
-                        usesRegs = true;
                         if (currentInvariant.find(ra) == currentInvariant.end())
                             allInvariant = false;
                         break;
@@ -846,7 +692,6 @@ public:
                     case Opcode::ANDI: case Opcode::ORI: case Opcode::XORI:
                     case Opcode::SHLI: case Opcode::SHRI: case Opcode::SAR_I:
                     case Opcode::LEA: {
-                        usesRegs = true;
                         if (currentInvariant.find(ra) == currentInvariant.end())
                             allInvariant = false;
                         break;
@@ -858,7 +703,6 @@ public:
                     case Opcode::ROL: case Opcode::ROR:
                     case Opcode::ADDF: case Opcode::SUBF: case Opcode::MULF: case Opcode::DIVF:
                     case Opcode::BEXTR: case Opcode::BZHI: case Opcode::PDEP: {
-                        usesRegs = true;
                         if (currentInvariant.find(ra) == currentInvariant.end() ||
                             currentInvariant.find(rb) == currentInvariant.end())
                             allInvariant = false;

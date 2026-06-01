@@ -231,14 +231,20 @@ public:
 
     u32 LdrRegOffset(u8 rt, u8 rn, i16 offset)
     {
-        u32 uoff = static_cast<u32>(offset) & 0xFFF;
-        return 0xF9400000u | (uoff << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F);
+        if (offset >= 0) {
+            u32 uoff = static_cast<u32>(offset) & 0xFFF;
+            return 0xF9400000u | (uoff << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F);
+        }
+        return LdrPreIndex(rt, rn, offset);
     }
 
     u32 StrRegOffset(u8 rt, u8 rn, i16 offset)
     {
-        u32 uoff = static_cast<u32>(offset) & 0xFFF;
-        return 0xF9000000u | (uoff << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F);
+        if (offset >= 0) {
+            u32 uoff = static_cast<u32>(offset) & 0xFFF;
+            return 0xF9000000u | (uoff << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F);
+        }
+        return StrPreIndex(rt, rn, offset);
     }
 
     u32 LdrWOffset(u8 rt, u8 rn, i16 offset)

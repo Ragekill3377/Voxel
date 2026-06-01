@@ -38,7 +38,6 @@ if(VOXEL_BUILD_EXAMPLES)
 endif()
 
 enable_testing()
-add_test(NAME voxel-demo  COMMAND voxel-demo)
 add_test(NAME voxel-test  COMMAND voxel-test)
 add_test(NAME voxel-jit   COMMAND voxel-jit-test)
 
