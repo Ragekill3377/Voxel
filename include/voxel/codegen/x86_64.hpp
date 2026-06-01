@@ -1395,24 +1395,73 @@ public:
                 break;
 
             case Opcode::ADD:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.AddRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
+                {
+                    u8 hra = scalarHost[ra], hrb = scalarHost[rb], hrd = scalarHost[rd];
+                    u8 ga = (hra != REG_NONE) ? hra : static_cast<u8>(Reg64::RAX);
+                    u8 gb = (hrb != REG_NONE) ? hrb : static_cast<u8>(Reg64::RCX);
+                    if (hra == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + ra*8); a.MovRegMem(ga, static_cast<u8>(Reg64::R14), off); }
+                    if (hrb == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + rb*8); a.MovRegMem(gb, static_cast<u8>(Reg64::R14), off); }
+                    a.AddRegReg(ga, gb);
+                    if (hrd != REG_NONE) { if (hrd != ga) a.MovRegReg(hrd, ga); }
+                    else { i32 off = static_cast<i32>(kScalarRegOffset + rd*8); a.MovMemReg(static_cast<u8>(Reg64::R14), off, ga); }
+                    ++bcIdx;
+                }
                 break;
 
             case Opcode::SUB:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.SubRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
+                {
+                    u8 hra = scalarHost[ra], hrb = scalarHost[rb], hrd = scalarHost[rd];
+                    u8 ga = (hra != REG_NONE) ? hra : static_cast<u8>(Reg64::RAX);
+                    u8 gb = (hrb != REG_NONE) ? hrb : static_cast<u8>(Reg64::RCX);
+                    if (hra == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + ra*8); a.MovRegMem(ga, static_cast<u8>(Reg64::R14), off); }
+                    if (hrb == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + rb*8); a.MovRegMem(gb, static_cast<u8>(Reg64::R14), off); }
+                    a.SubRegReg(ga, gb);
+                    if (hrd != REG_NONE) { if (hrd != ga) a.MovRegReg(hrd, ga); }
+                    else { i32 off = static_cast<i32>(kScalarRegOffset + rd*8); a.MovMemReg(static_cast<u8>(Reg64::R14), off, ga); }
+                    ++bcIdx;
+                }
                 break;
 
-            case Opcode::MUL:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
+            case Opcode::CMP:
+                {
+                    u8 hra = scalarHost[ra], hrb = scalarHost[rb];
+                    u8 ga = (hra != REG_NONE) ? hra : static_cast<u8>(Reg64::RAX);
+                    u8 gb = (hrb != REG_NONE) ? hrb : static_cast<u8>(Reg64::RCX);
+                    if (hra == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + ra*8); a.MovRegMem(ga, static_cast<u8>(Reg64::R14), off); }
+                    if (hrb == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + rb*8); a.MovRegMem(gb, static_cast<u8>(Reg64::R14), off); }
+                    a.CmpRegReg(ga, gb);
+                    ++bcIdx;
+                }
+                break;
+
+            case Opcode::ADDF:
+                {
+                    u8 hra = scalarHost[ra], hrb = scalarHost[rb], hrd = scalarHost[rd];
+                    if (hra != REG_NONE)
+                        a.MovqXmmReg(0, hra);
+                    else {
+                        i32 off = static_cast<i32>(kScalarRegOffset + ra*8);
+                        a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
+                        a.MovqXmmReg(0, static_cast<u8>(Reg64::RAX));
+                    }
+                    if (hrb != REG_NONE)
+                        a.MovqXmmReg(1, hrb);
+                    else {
+                        i32 off = static_cast<i32>(kScalarRegOffset + rb*8);
+                        a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
+                        a.MovqXmmReg(1, static_cast<u8>(Reg64::RAX));
+                    }
+                    a.Vaddsd(0, 0, 1);
+                    a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
+                    if (hrd != REG_NONE)
+                        a.MovRegReg(hrd, static_cast<u8>(Reg64::RAX));
+                    else {
+                        i32 off = static_cast<i32>(kScalarRegOffset + rd*8);
+                        a.MovMemReg(static_cast<u8>(Reg64::R14), off, static_cast<u8>(Reg64::RAX));
+                    }
+                    ++bcIdx;
+                }
+                break;
                 a.ImulRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
                 storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
                 ++bcIdx;
@@ -1471,24 +1520,6 @@ public:
                 loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
                 a.NOTReg(static_cast<u8>(Reg64::RAX));
                 storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::ADDF:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                a.MovqXmmReg(0, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                a.MovqXmmReg(1, static_cast<u8>(Reg64::RAX));
-                a.Vaddsd(0, 0, 1);
-                a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::CMP:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.CmpRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
                 ++bcIdx;
                 break;
 
@@ -1570,13 +1601,20 @@ public:
                 {
                     u8 segId = static_cast<u8>((raw >> 28) & 0xF);
                     u8 count = static_cast<u8>(imm12 & 0xFF);
-                    if (count == 0) count = 4; // assume 256b / 8 = 32 bytes = 4 × f64
+                    if (count == 0) count = 4;
 
                     a.MovRegMem(static_cast<u8>(Reg64::R15),
                                 static_cast<u8>(Reg64::R13),
                                 static_cast<i32>(static_cast<sz>(segId) * 8));
-                    loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                    a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3); // multiply index by 8
+                    u8 hra = scalarHost[ra];
+                    if (hra != REG_NONE) {
+                        if (hra != static_cast<u8>(Reg64::RAX)) a.MovRegReg(static_cast<u8>(Reg64::RAX), hra);
+                        a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
+                    } else {
+                        i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(ra) * 8);
+                        a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
+                        a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
+                    }
                     a.AddRegReg(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::RAX));
 
                     a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R15), 0);
