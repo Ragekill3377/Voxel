@@ -5,6 +5,8 @@
 #include <cstring>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
+#include <bitset>
 
 namespace voxel {
 namespace codegen {
@@ -1182,6 +1184,7 @@ public:
 
     bool Compile(const u32* bytecode, sz bytecodeSize, JitFunction& out) override
     {
+        (void)bytecodeSize;
         std::vector<u8> code;
         code.reserve(bytecodeSize * 64);
         X64Assembler a(code);
@@ -1213,419 +1216,398 @@ public:
         a.MovRegReg(static_cast<u8>(Reg64::R12), static_cast<u8>(Reg64::RDX));
 
         // ------------------------------------------------------------
-        // Translate bytecode
+        // Branch patch support
         // ------------------------------------------------------------
-        // We collect label table for branch offsets.
-        // Each bytecode instruction is 4 bytes (u32), extended
-        // instructions consume additional u32s.
         struct BranchPatch {
             sz codeOffset;
             sz bcIndex;
             BranchPatch(sz co, sz bi) : codeOffset(co), bcIndex(bi) {}
         };
         std::vector<BranchPatch> patches;
+        std::vector<sz> haltPatches;
 
-        // Pre-pass: determine bytecode labels (offsets in instruction count)
-        // We use the bytecode index. The translation loop will emit code
-        // and record when it emits a branch that needs patching.
+        std::unordered_map<sz, sz> bcToCode2;
 
-        // Map bytecode index → code offset for branch resolution
-        std::unordered_map<sz, sz> bcToCode;
+        // ------------------------------------------------------------
+        // Basic-block structures
+        // ------------------------------------------------------------
+        struct Block {
+            sz start;
+            sz end;
+            sz branchTarget;
+            sz fallthrough;
+            bool isBackward;
+            bool isConditional;
+            std::bitset<16> liveIn;
+            std::bitset<16> liveOut;
+        };
 
-        // ----------------------------------------------------------------
-        // Register allocator: pre-scan bytecode to identify hot scalars
-        // and assign dedicated host GPRs (avoids regfile roundtrips)
-        // ----------------------------------------------------------------
-        constexpr u8 REG_NONE = 0xFF;
+        static constexpr u8 REG_NONE = 0xFF;
         static constexpr u8 kAllocGprs[] = {
             static_cast<u8>(Reg64::RBX),
-            static_cast<u8>(Reg64::R8),  static_cast<u8>(Reg64::R9),
-            static_cast<u8>(Reg64::R10), static_cast<u8>(Reg64::R11),
+            static_cast<u8>(Reg64::R8),
+            static_cast<u8>(Reg64::R9),
+            static_cast<u8>(Reg64::R10),
+            static_cast<u8>(Reg64::R11),
+            static_cast<u8>(Reg64::RDI),
+            static_cast<u8>(Reg64::RSI),
         };
         static constexpr sz kNumAllocGprs = sizeof(kAllocGprs) / sizeof(kAllocGprs[0]);
 
-        u32 scalarUse[64] = {};
+        auto immAsRel = [](u16 imm12) -> i32 {
+            if (imm12 & 0x800) return static_cast<i32>(static_cast<i16>(imm12 | 0xF000));
+            return static_cast<i32>(imm12);
+        };
+
+        static auto isBranchOp = [](u8 op) -> bool {
+            return op == 0x50 || op == 0x51 || op == 0x52 ||
+                   op == 0x59 || op == 0x5A || op == 0x5B || op == 0x5C;
+        };
+
+        static auto isTerminalOp = [](u8 op) -> bool {
+            return isBranchOp(op) || op == 0x01 || op == 0x5E; // HALT, RET
+        };
+
+        // ------------------------------------------------------------
+        // Step 1: Basic-block detection
+        // ------------------------------------------------------------
+        std::unordered_set<sz> blockStarts;
+        blockStarts.insert(0);
+
         for (sz i = 0; i < bytecodeSize; ++i) {
             u32 raw = bytecode[i];
-            u8 rd = (raw >> 8) & 0xF;
-            u8 ra = (raw >> 12) & 0xF;
-            u8 rb = (raw >> 16) & 0xF;
-            scalarUse[rd]++; scalarUse[ra]++; scalarUse[rb]++;
+            u8 op = static_cast<u8>(raw & 0xFF);
+            u16 imm12 = static_cast<u16>((raw >> 20) & 0xFFF);
+
+            if (isBranchOp(op)) {
+                i32 rel = immAsRel(imm12);
+                sz target = static_cast<sz>(static_cast<isz>(i) + rel);
+                if (target < bytecodeSize) blockStarts.insert(target);
+                if (i + 1 < bytecodeSize) blockStarts.insert(i + 1);
+            } else if (op == 0x01 || op == 0x5E) {
+                if (i + 1 < bytecodeSize) blockStarts.insert(i + 1);
+            }
         }
 
-        u8 scalarHost[64];
-        bool scalarDirty[64] = {};
-        for (sz i = 0; i < 64; ++i) scalarHost[i] = REG_NONE;
+        std::vector<Block> blocks;
+        sz currentStart = 0;
+        for (sz i = 0; i < bytecodeSize; ++i) {
+            bool endBlock = false;
+            u32 raw = bytecode[i];
+            u8 op = static_cast<u8>(raw & 0xFF);
 
-        u8 vectorHost[16];
-        bool vectorDirty[16] = {};
-        for (sz i = 0; i < 16; ++i) vectorHost[i] = REG_NONE;
+            if (isTerminalOp(op)) {
+                endBlock = true;
+            } else if (i + 1 < bytecodeSize && blockStarts.count(i + 1)) {
+                endBlock = true;
+            }
 
-        // Liveness: is a VM register read again before its next write?
-        // scanned forward from each instruction position
-        auto isDeadScalar = [&](u8 vreg, sz fromIdx) -> bool {
-            for (sz i = fromIdx + 1; i < bytecodeSize; ++i) {
-                u32 r2 = bytecode[i];
-                u8 op2 = r2 & 0xFF;
-                u8 rd2 = (r2 >> 8) & 0xF;
-                u8 ra2 = (r2 >> 12) & 0xF;
-                u8 rb2 = (r2 >> 16) & 0xF;
-                if (op2 == static_cast<u8>(Opcode::JMP) || op2 == static_cast<u8>(Opcode::JZ) ||
-                    op2 == static_cast<u8>(Opcode::JNZ) || op2 == static_cast<u8>(Opcode::HALT) ||
-                    op2 == static_cast<u8>(Opcode::RET) || op2 == static_cast<u8>(Opcode::CALL))
-                    return true; // branch: conservatively assume dead after branch
-                if (rd2 == vreg) return true; // overwritten before read → dead
-                if (ra2 == vreg || rb2 == vreg) return false; // read before overwrite → live
+            if (endBlock) {
+                Block b;
+                b.start         = currentStart;
+                b.end           = i;
+                b.branchTarget  = static_cast<sz>(-1);
+                b.fallthrough   = static_cast<sz>(-1);
+                b.isBackward    = false;
+                b.isConditional = false;
+
+                op = static_cast<u8>(bytecode[i] & 0xFF);
+                u16 imm12 = static_cast<u16>((bytecode[i] >> 20) & 0xFFF);
+
+                if (op == 0x50) {
+                    i32 rel = immAsRel(imm12);
+                    sz target = static_cast<sz>(static_cast<isz>(i) + rel);
+                    if (target < bytecodeSize) b.branchTarget = target;
+                } else if (isBranchOp(op)) {
+                    i32 rel = immAsRel(imm12);
+                    sz target = static_cast<sz>(static_cast<isz>(i) + rel);
+                    if (target < bytecodeSize) b.branchTarget = target;
+                    b.isConditional = true;
+                    if (i + 1 < bytecodeSize) b.fallthrough = i + 1;
+                }
+                if (b.branchTarget != static_cast<sz>(-1) && b.branchTarget <= i)
+                    b.isBackward = true;
+
+                blocks.push_back(b);
+                currentStart = i + 1;
             }
-            return true; // end of code → dead
-        };
-        auto isDeadVector = [&](u8 vreg, sz fromIdx) -> bool {
-            for (sz i = fromIdx + 1; i < bytecodeSize; ++i) {
-                u32 r2 = bytecode[i];
-                u8 op2 = r2 & 0xFF;
-                u8 rd2 = (r2 >> 8) & 0xF;
-                u8 ra2 = (r2 >> 12) & 0xF;
-                u8 rb2 = (r2 >> 16) & 0xF;
-                if (op2 == static_cast<u8>(Opcode::JMP) || op2 == static_cast<u8>(Opcode::JZ) ||
-                    op2 == static_cast<u8>(Opcode::JNZ) || op2 == static_cast<u8>(Opcode::HALT) ||
-                    op2 == static_cast<u8>(Opcode::RET) || op2 == static_cast<u8>(Opcode::CALL))
-                    return true;
-                if (rd2 == vreg) return true;
-                if (ra2 == vreg || rb2 == vreg) return false;
-            }
-            return true;
-        };
-        u8 nextGpr = 0;
-        for (sz round = 0; round < 64 && nextGpr < kNumAllocGprs; ++round) {
-            u32 best = 0; sz bestIdx = 0;
-            for (sz r = 0; r < 64; ++r) {
-                if (scalarHost[r] == REG_NONE && scalarUse[r] > best) { best = scalarUse[r]; bestIdx = r; }
-            }
-            if (best == 0) break;
-            scalarHost[bestIdx] = kAllocGprs[nextGpr];
-            scalarUse[bestIdx] = 0;
-            ++nextGpr;
+        }
+        if (currentStart < bytecodeSize) {
+            Block b;
+            b.start         = currentStart;
+            b.end           = bytecodeSize - 1;
+            b.branchTarget  = static_cast<sz>(-1);
+            b.fallthrough   = static_cast<sz>(-1);
+            b.isBackward    = false;
+            b.isConditional = false;
+            blocks.push_back(b);
         }
 
-        auto loadScalarReg = [&](u8 vreg, u8 fbGpr) {
-            u8 h = scalarHost[vreg];
-            if (h != REG_NONE) {
-                if (h != fbGpr) a.MovRegReg(fbGpr, h);
-            } else {
-                i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
-                a.MovRegMem(fbGpr, static_cast<u8>(Reg64::R14), off);
-            }
-        };
-        auto storeScalarReg = [&](u8 vreg, u8 valGpr) {
-            u8 h = scalarHost[vreg];
-            if (h != REG_NONE) {
-                if (h != valGpr) a.MovRegReg(h, valGpr);
-            } else {
-                i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
-                a.MovMemReg(static_cast<u8>(Reg64::R14), off, valGpr);
-            }
-        };
-        auto loadVectorReg = [&](u8 vreg, u8 ymmreg) {
-            if (vectorHost[ymmreg] == vreg) return;
-            if (vectorHost[ymmreg] != REG_NONE && vectorDirty[vectorHost[ymmreg]]) {
-                i32 off2 = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vectorHost[ymmreg]) * kVectorStride);
-                a.VmovupdMemYmm(static_cast<u8>(Reg64::R14), off2, ymmreg);
-                vectorDirty[vectorHost[ymmreg]] = false;
-            }
-            i32 off = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vreg) * kVectorStride);
-            a.VmovupdYmmMem(ymmreg, static_cast<u8>(Reg64::R14), off);
-            vectorHost[ymmreg] = vreg;
-            vectorDirty[vreg] = false;
-        };
-        auto storeVectorReg = [&](u8 vreg, u8 ymmreg, sz bcIdx) {
-            vectorHost[ymmreg] = vreg;
-            if (isDeadVector(vreg, bcIdx)) {
-                vectorDirty[vreg] = true;
-            } else {
-                i32 off = static_cast<i32>(kVectorRegOffset + static_cast<sz>(vreg) * kVectorStride);
-                a.VmovupdMemYmm(static_cast<u8>(Reg64::R14), off, ymmreg);
-                vectorDirty[vreg] = false;
-            }
-        };
-        auto flushScalars = [&]() {
-            for (sz i = 0; i < 64; ++i) {
-                u8 h = scalarHost[i];
-                if (h != REG_NONE) {
-                    i32 off = static_cast<i32>(kScalarRegOffset + i * 8);
-                    a.MovMemReg(static_cast<u8>(Reg64::R14), off, h);
+        // Build successor/predecessor maps
+        std::vector<std::vector<sz>> successors(blocks.size());
+        std::vector<std::vector<sz>> predecessors(blocks.size());
+        std::unordered_map<sz, sz> bcToBlockId;
+
+        for (sz bid = 0; bid < blocks.size(); ++bid) {
+            bcToBlockId[blocks[bid].start] = bid;
+        }
+        for (sz bid = 0; bid < blocks.size(); ++bid) {
+            const auto& b = blocks[bid];
+            if (b.branchTarget != static_cast<sz>(-1)) {
+                auto it = bcToBlockId.find(b.branchTarget);
+                if (it != bcToBlockId.end()) {
+                    successors[bid].push_back(it->second);
+                    predecessors[it->second].push_back(bid);
                 }
             }
-        };
-
-        // Pre-load assigned host GPRs from regfile
-        for (sz i = 0; i < 64; ++i) {
-            u8 h = scalarHost[i];
-            if (h != REG_NONE) {
-                i32 off = static_cast<i32>(kScalarRegOffset + i * 8);
-                a.MovRegMem(h, static_cast<u8>(Reg64::R14), off);
+            if (b.isConditional && b.fallthrough != static_cast<sz>(-1)) {
+                auto it = bcToBlockId.find(b.fallthrough);
+                if (it != bcToBlockId.end()) {
+                    successors[bid].push_back(it->second);
+                    predecessors[it->second].push_back(bid);
+                }
             }
         }
 
-        sz bcIdx = 0;
-        while (bcIdx < bytecodeSize) {
-            bcToCode[bcIdx] = a.CurrentOffset;
-            u32 raw = bytecode[bcIdx];
-            u8  op  = static_cast<u8>(raw & 0xFF);
-            u8  rd  = static_cast<u8>((raw >> 8) & 0xF);
-            u8  ra  = static_cast<u8>((raw >> 12) & 0xF);
-            u8  rb  = static_cast<u8>((raw >> 16) & 0xF);
-            u16 imm12 = static_cast<u16>((raw >> 20) & 0xFFF);
-            auto immAsRel = [](u16 imm12) -> i32 {
-                if (imm12 & 0x800) return static_cast<i32>(static_cast<i16>(imm12 | 0xF000));
-                return static_cast<i32>(imm12);
+        // ------------------------------------------------------------
+        // Step 2: Liveness analysis (iterative dataflow)
+        // ------------------------------------------------------------
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (isz bidx = static_cast<isz>(blocks.size()) - 1; bidx >= 0; --bidx) {
+                sz bid = static_cast<sz>(bidx);
+                auto& b = blocks[bid];
+
+                // recompute liveOut from successors
+                std::bitset<16> newLiveOut;
+                for (sz sid : successors[bid])
+                    newLiveOut |= blocks[sid].liveIn;
+                if (newLiveOut != b.liveOut) {
+                    b.liveOut = newLiveOut;
+                    changed = true;
+                }
+
+                // backward scan through block to compute liveIn
+                std::bitset<16> live = b.liveOut;
+                for (sz i = b.end; i >= b.start && i != static_cast<sz>(-1); --i) {
+                    u32 raw = bytecode[i];
+                    u8 op = static_cast<u8>(raw & 0xFF);
+                    u8 rd = static_cast<u8>((raw >> 8) & 0xF);
+                    u8 ra = static_cast<u8>((raw >> 12) & 0xF);
+                    u8 rb = static_cast<u8>((raw >> 16) & 0xF);
+
+                    bool scalarDef = false;
+                    scalarDef = (op == 0x10 || op == 0x11 || op == 0x12 ||
+                                 op == 0x20 || op == 0x21 || op == 0x22 ||
+                                 op == 0x2A || op == 0xD0);
+
+                    if (scalarDef && rd < 16) live.reset(rd);
+
+                    bool raIsScalarUse = (op == 0x11 || op == 0x12 || op == 0x20 ||
+                                          op == 0x21 || op == 0x22 || op == 0x2A ||
+                                          op == 0x40 || op == 0x41 || op == 0x70 ||
+                                          op == 0x71 || op == 0x78 || op == 0xD0);
+                    if (raIsScalarUse && ra < 16) live.set(ra);
+
+                    bool rbIsScalarUse = (op == 0x20 || op == 0x21 || op == 0x22 ||
+                                          op == 0x2A || op == 0x40 || op == 0x41 ||
+                                          op == 0xC5 || op == 0xD0); // D0=VSUM uses ra only
+                    // VSUM: rd=scalar, ra=vector (not scalar use for ra, but rd is scalar def)
+                    // Actually VSUM(D0): rd=scalar dest, ra=vector source
+                    // VFILTER_GT(C5): rd=vector, ra=vector, rb=scalar threshold
+                    if (rbIsScalarUse && rb < 16) live.set(rb);
+                    // Also VLOAD/VSTORE: ra is scalar index
+                    if ((op == 0x70 || op == 0x71) && ra < 16) live.set(ra);
+                }
+
+                if (live != b.liveIn) {
+                    b.liveIn = live;
+                    changed = true;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Step 3: Per-block register allocation
+        // ------------------------------------------------------------
+        struct BlockAlloc {
+            u8 gprForReg[16];
+            BlockAlloc() { for (int i = 0; i < 16; ++i) gprForReg[i] = REG_NONE; }
+        };
+        std::vector<BlockAlloc> blockAllocs(blocks.size());
+
+        for (sz bid = 0; bid < blocks.size(); ++bid) {
+            auto& alloc = blockAllocs[bid];
+            const auto& b = blocks[bid];
+
+            std::bitset<16> need = b.liveIn | b.liveOut;
+            // Also add scalar temps (written within block)
+            for (sz i = b.start; i <= b.end; ++i) {
+                u32 raw = bytecode[i];
+                u8 op = static_cast<u8>(raw & 0xFF);
+                u8 rd = static_cast<u8>((raw >> 8) & 0xF);
+                if ((op == 0x10 || op == 0x11 || op == 0x12 ||
+                     op == 0x20 || op == 0x21 || op == 0x22 ||
+                     op == 0x2A || op == 0xD0) && rd < 16)
+                    need.set(rd);
+            }
+
+            int gprIdx = 0;
+            // Assign liveIn first
+            for (int r = 0; r < 16; ++r) {
+                if (b.liveIn.test(r) && gprIdx < static_cast<int>(kNumAllocGprs)) {
+                    alloc.gprForReg[r] = kAllocGprs[gprIdx++];
+                }
+            }
+            // Assign remaining liveOut
+            for (int r = 0; r < 16; ++r) {
+                if (b.liveOut.test(r) && !b.liveIn.test(r) && alloc.gprForReg[r] == REG_NONE && gprIdx < static_cast<int>(kNumAllocGprs)) {
+                    alloc.gprForReg[r] = kAllocGprs[gprIdx++];
+                }
+            }
+            // Assign other temps
+            for (int r = 0; r < 16; ++r) {
+                if (need.test(r) && alloc.gprForReg[r] == REG_NONE && gprIdx < static_cast<int>(kNumAllocGprs)) {
+                    alloc.gprForReg[r] = kAllocGprs[gprIdx++];
+                }
+            }
+        }
+
+        // ------------------------------------------------------------
+        // Step 4: Code emission
+        // ------------------------------------------------------------
+        constexpr u8 VEC_NONE = 0xFF;
+        u8 ymmHolds = VEC_NONE;
+
+        for (sz bid = 0; bid < blocks.size(); ++bid) {
+            const auto& b     = blocks[bid];
+            const auto& alloc = blockAllocs[bid];
+
+            auto getScalar = [&](u8 vreg) -> u8 {
+                if (vreg < 16 && alloc.gprForReg[vreg] != REG_NONE)
+                    return alloc.gprForReg[vreg];
+                i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
+                a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
+                return static_cast<u8>(Reg64::RAX);
             };
 
-            (void)a.CurrentOffset;
+            auto putScalar = [&](u8 vreg, u8 srcGpr) {
+                if (vreg < 16 && alloc.gprForReg[vreg] != REG_NONE) {
+                    if (alloc.gprForReg[vreg] != srcGpr)
+                        a.MovRegReg(alloc.gprForReg[vreg], srcGpr);
+                } else {
+                    i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(vreg) * 8);
+                    a.MovMemReg(static_cast<u8>(Reg64::R14), off, srcGpr);
+                }
+            };
 
-            switch (static_cast<Opcode>(op)) {
+            bool isLoopHeader = b.isBackward;
+            // For loop headers: load liveIn FIRST (prologue falls through here),
+            // then record bcToCode2 (backward branches jump here, skipping load).
+            if (isLoopHeader) {
+                for (int r = 0; r < 16; ++r) {
+                    if (b.liveIn.test(r) && alloc.gprForReg[r] != REG_NONE) {
+                        i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(r) * 8);
+                        a.MovRegMem(alloc.gprForReg[r], static_cast<u8>(Reg64::R14), off);
+                    }
+                }
+            }
 
-            case Opcode::NOP:
-                a.Nop();
-                ++bcIdx;
-                break;
+            // Record block start for branch targets
+            bcToCode2[b.start] = a.CurrentOffset;
 
-            case Opcode::HALT:
-                goto doneTranslating;
+            if (!isLoopHeader) ymmHolds = VEC_NONE;
 
-            case Opcode::RET:
-                goto doneTranslating;
+            // For non-loop-headers: load liveIn AFTER bcToCode2 (branches enter here with load)
+            if (!isLoopHeader) {
+                for (int r = 0; r < 16; ++r) {
+                    if (b.liveIn.test(r) && alloc.gprForReg[r] != REG_NONE) {
+                        i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(r) * 8);
+                        a.MovRegMem(alloc.gprForReg[r], static_cast<u8>(Reg64::R14), off);
+                    }
+                }
+            }
 
-            case Opcode::MOV:
-                a.MovRegImm(static_cast<u8>(Reg64::RAX), static_cast<u64>(static_cast<i64>(immAsRel(imm12))));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+            // Emit instructions in the block
+            for (sz i = b.start; i <= b.end; ++i) {
+                u32 raw = bytecode[i];
+                u8 op  = static_cast<u8>(raw & 0xFF);
+                u8 rd  = static_cast<u8>((raw >> 8) & 0xF);
+                u8 ra  = static_cast<u8>((raw >> 12) & 0xF);
+                u8 rb  = static_cast<u8>((raw >> 16) & 0xF);
+                u16 imm12 = static_cast<u16>((raw >> 20) & 0xFFF);
 
-            case Opcode::MOVR:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+                switch (static_cast<Opcode>(op)) {
 
-            case Opcode::ADDI:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                a.AddRegImm(static_cast<u8>(Reg64::RAX), immAsRel(imm12));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+                case Opcode::NOP:
+                    a.Nop();
+                    break;
 
-            case Opcode::SUBI:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                a.SubRegImm(static_cast<u8>(Reg64::RAX), immAsRel(imm12));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+                case Opcode::MOV: {
+                    i64 immVal = static_cast<i64>(immAsRel(imm12));
+                    a.MovRegImm(static_cast<u8>(Reg64::RAX), static_cast<u64>(immVal));
+                    putScalar(rd, static_cast<u8>(Reg64::RAX));
+                    break;
+                }
 
-            case Opcode::ADD:
-                {
-                    u8 hra = scalarHost[ra], hrb = scalarHost[rb], hrd = scalarHost[rd];
-                    u8 ga = (hra != REG_NONE) ? hra : static_cast<u8>(Reg64::RAX);
-                    u8 gb = (hrb != REG_NONE) ? hrb : static_cast<u8>(Reg64::RCX);
-                    if (hra == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + ra*8); a.MovRegMem(ga, static_cast<u8>(Reg64::R14), off); }
-                    if (hrb == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + rb*8); a.MovRegMem(gb, static_cast<u8>(Reg64::R14), off); }
+                case Opcode::MOVR: {
+                    u8 g = getScalar(ra);
+                    putScalar(rd, g);
+                    break;
+                }
+
+                case Opcode::ADDI: {
+                    u8 g = getScalar(ra);
+                    if (g != static_cast<u8>(Reg64::RAX)) a.MovRegReg(static_cast<u8>(Reg64::RAX), g);
+                    a.AddRegImm(static_cast<u8>(Reg64::RAX), immAsRel(imm12));
+                    putScalar(rd, static_cast<u8>(Reg64::RAX));
+                    break;
+                }
+
+                case Opcode::ADD: {
+                    u8 ga = getScalar(ra);
+                    u8 gb = getScalar(rb);
                     a.AddRegReg(ga, gb);
-                    if (hrd != REG_NONE) { if (hrd != ga) a.MovRegReg(hrd, ga); }
-                    else { i32 off = static_cast<i32>(kScalarRegOffset + rd*8); a.MovMemReg(static_cast<u8>(Reg64::R14), off, ga); }
-                    ++bcIdx;
+                    putScalar(rd, ga);
+                    break;
                 }
-                break;
 
-            case Opcode::SUB:
-                {
-                    u8 hra = scalarHost[ra], hrb = scalarHost[rb], hrd = scalarHost[rd];
-                    u8 ga = (hra != REG_NONE) ? hra : static_cast<u8>(Reg64::RAX);
-                    u8 gb = (hrb != REG_NONE) ? hrb : static_cast<u8>(Reg64::RCX);
-                    if (hra == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + ra*8); a.MovRegMem(ga, static_cast<u8>(Reg64::R14), off); }
-                    if (hrb == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + rb*8); a.MovRegMem(gb, static_cast<u8>(Reg64::R14), off); }
+                case Opcode::SUB: {
+                    u8 ga = getScalar(ra);
+                    u8 gb = getScalar(rb);
                     a.SubRegReg(ga, gb);
-                    if (hrd != REG_NONE) { if (hrd != ga) a.MovRegReg(hrd, ga); }
-                    else { i32 off = static_cast<i32>(kScalarRegOffset + rd*8); a.MovMemReg(static_cast<u8>(Reg64::R14), off, ga); }
-                    ++bcIdx;
+                    putScalar(rd, ga);
+                    break;
                 }
-                break;
 
-            case Opcode::CMP:
-                {
-                    u8 hra = scalarHost[ra], hrb = scalarHost[rb];
-                    u8 ga = (hra != REG_NONE) ? hra : static_cast<u8>(Reg64::RAX);
-                    u8 gb = (hrb != REG_NONE) ? hrb : static_cast<u8>(Reg64::RCX);
-                    if (hra == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + ra*8); a.MovRegMem(ga, static_cast<u8>(Reg64::R14), off); }
-                    if (hrb == REG_NONE) { i32 off = static_cast<i32>(kScalarRegOffset + rb*8); a.MovRegMem(gb, static_cast<u8>(Reg64::R14), off); }
-                    a.CmpRegReg(ga, gb);
-                    ++bcIdx;
+                case Opcode::MUL: {
+                    u8 ga = getScalar(ra);
+                    u8 gb = getScalar(rb);
+                    a.ImulRegReg(ga, gb);
+                    putScalar(rd, ga);
+                    break;
                 }
-                break;
 
-            case Opcode::ADDF:
-                {
-                    u8 hra = scalarHost[ra], hrb = scalarHost[rb], hrd = scalarHost[rd];
-                    if (hra != REG_NONE)
-                        a.MovqXmmReg(0, hra);
-                    else {
-                        i32 off = static_cast<i32>(kScalarRegOffset + ra*8);
-                        a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
-                        a.MovqXmmReg(0, static_cast<u8>(Reg64::RAX));
-                    }
-                    if (hrb != REG_NONE)
-                        a.MovqXmmReg(1, hrb);
-                    else {
-                        i32 off = static_cast<i32>(kScalarRegOffset + rb*8);
-                        a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
-                        a.MovqXmmReg(1, static_cast<u8>(Reg64::RAX));
-                    }
+                case Opcode::ADDF: {
+                    u8 ga = getScalar(ra);
+                    u8 gb = getScalar(rb);
+                    a.MovqXmmReg(0, ga);
+                    a.MovqXmmReg(1, gb);
                     a.Vaddsd(0, 0, 1);
                     a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
-                    if (hrd != REG_NONE)
-                        a.MovRegReg(hrd, static_cast<u8>(Reg64::RAX));
-                    else {
-                        i32 off = static_cast<i32>(kScalarRegOffset + rd*8);
-                        a.MovMemReg(static_cast<u8>(Reg64::R14), off, static_cast<u8>(Reg64::RAX));
-                    }
-                    ++bcIdx;
+                    putScalar(rd, static_cast<u8>(Reg64::RAX));
+                    break;
                 }
-                break;
-                a.ImulRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
 
-            case Opcode::DIV:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.Cqo();
-                a.IdivReg(static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::MOD:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.Cqo();
-                a.IdivReg(static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RDX));
-                ++bcIdx;
-                break;
-
-            case Opcode::NEG:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                a.NEGReg(static_cast<u8>(Reg64::RAX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::AND:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.ANDRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::OR:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.ORRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::XOR:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.XORRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::NOT:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                a.NOTReg(static_cast<u8>(Reg64::RAX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::CMPF:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                loadScalarReg(rb, static_cast<u8>(Reg64::RCX));
-                a.CmpRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RCX));
-                ++bcIdx;
-                break;
-
-            case Opcode::JMP:
-                {
-                    i32 bcTarget = static_cast<i32>(bcIdx) + immAsRel(imm12);
-                    a.JmpRel32(0);
-                    patches.push_back(BranchPatch{a.CurrentOffset - 4, static_cast<sz>(bcTarget)});
-                    ++bcIdx;
+                case Opcode::CMP: {
+                    u8 ga = getScalar(ra);
+                    u8 gb = getScalar(rb);
+                    a.CmpRegReg(ga, gb);
+                    break;
                 }
-                break;
 
-            case Opcode::JZ:
-                {
-                    i32 bcTarget = static_cast<i32>(bcIdx) + immAsRel(imm12);
-                    a.JzRel32(0);
-                    patches.push_back(BranchPatch{a.CurrentOffset - 4, static_cast<sz>(bcTarget)});
-                    ++bcIdx;
-                }
-                break;
-
-            case Opcode::JNZ:
-                {
-                    i32 bcTarget = static_cast<i32>(bcIdx) + immAsRel(imm12);
-                    a.JnzRel32(0);
-                    patches.push_back(BranchPatch{a.CurrentOffset - 4, static_cast<sz>(bcTarget)});
-                    ++bcIdx;
-                }
-                break;
-
-            case Opcode::JL:
-                {
-                    i32 bcTarget = static_cast<i32>(bcIdx) + immAsRel(imm12);
-                    a.JlRel32(0);
-                    patches.push_back(BranchPatch{a.CurrentOffset - 4, static_cast<sz>(bcTarget)});
-                    ++bcIdx;
-                }
-                break;
-
-            case Opcode::JLE:
-                {
-                    i32 bcTarget = static_cast<i32>(bcIdx) + immAsRel(imm12);
-                    a.JleRel32(0);
-                    patches.push_back(BranchPatch{a.CurrentOffset - 4, static_cast<sz>(bcTarget)});
-                    ++bcIdx;
-                }
-                break;
-
-            case Opcode::JG:
-                {
-                    i32 bcTarget = static_cast<i32>(bcIdx) + immAsRel(imm12);
-                    a.JgRel32(0);
-                    patches.push_back(BranchPatch{a.CurrentOffset - 4, static_cast<sz>(bcTarget)});
-                    ++bcIdx;
-                }
-                break;
-
-            case Opcode::JGE:
-                {
-                    i32 bcTarget = static_cast<i32>(bcIdx) + immAsRel(imm12);
-                    a.JgeRel32(0);
-                    patches.push_back(BranchPatch{a.CurrentOffset - 4, static_cast<sz>(bcTarget)});
-                    ++bcIdx;
-                }
-                break;
-
-            // ------------------------------------------------------------
-            // Vector I/O
-            // ------------------------------------------------------------
-
-            case Opcode::VLOAD:
-                {
+                case Opcode::VLOAD: {
                     u8 segId = static_cast<u8>((raw >> 28) & 0xF);
                     u8 count = static_cast<u8>(imm12 & 0xFF);
                     if (count == 0) count = 4;
@@ -1633,358 +1615,253 @@ public:
                     a.MovRegMem(static_cast<u8>(Reg64::R15),
                                 static_cast<u8>(Reg64::R13),
                                 static_cast<i32>(static_cast<sz>(segId) * 8));
-                    u8 hra = scalarHost[ra];
-                    if (hra != REG_NONE) {
-                        if (hra != static_cast<u8>(Reg64::RAX)) a.MovRegReg(static_cast<u8>(Reg64::RAX), hra);
-                        a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
-                    } else {
-                        i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(ra) * 8);
-                        a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
-                        a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
-                    }
-                    a.AddRegReg(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::RAX));
-
-                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R15), 0);
-                    storeVectorReg(rd, 0, bcIdx);
-
-                    if (count > 4) {
-                        a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R15), 32);
-                        storeVectorReg(static_cast<u8>(rd + 1), 1, bcIdx);
-                    }
-                    ++bcIdx;
-                }
-                break;
-
-            case Opcode::VSTORE:
-                {
-                    u8 segId = static_cast<u8>((raw >> 28) & 0xF);
-                    u8 count = static_cast<u8>(imm12 & 0xFF);
-                    if (count == 0) count = 4;
-
-                    a.MovRegMem(static_cast<u8>(Reg64::R15),
-                                static_cast<u8>(Reg64::R13),
-                                static_cast<i32>(static_cast<sz>(segId) * 8));
-                    loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
+                    u8 g = getScalar(ra);
+                    if (g != static_cast<u8>(Reg64::RAX)) a.MovRegReg(static_cast<u8>(Reg64::RAX), g);
                     a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
                     a.AddRegReg(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::RAX));
-
-                    loadVectorReg(rd, 0);
-                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R15), 0, 0);
-
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R15), 0);
+                    ymmHolds = rd;
                     if (count > 4) {
-                        loadVectorReg(static_cast<u8>(rd + 1), 1);
+                        a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R15), 32);
+                        a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                        static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd + 1) * kVectorStride), 1);
+                    }
+                    break;
+                }
+
+                case Opcode::VSTORE: {
+                    u8 segId = static_cast<u8>((raw >> 28) & 0xF);
+                    u8 count = static_cast<u8>(imm12 & 0xFF);
+                    if (count == 0) count = 4;
+
+                    a.MovRegMem(static_cast<u8>(Reg64::R15),
+                                static_cast<u8>(Reg64::R13),
+                                static_cast<i32>(static_cast<sz>(segId) * 8));
+                    u8 g = getScalar(ra);
+                    if (g != static_cast<u8>(Reg64::RAX)) a.MovRegReg(static_cast<u8>(Reg64::RAX), g);
+                    a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
+                    a.AddRegReg(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::RAX));
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride));
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R15), 0, 0);
+                    if (count > 4) {
+                        a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                        static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd + 1) * kVectorStride));
                         a.VmovupdMemYmm(static_cast<u8>(Reg64::R15), 32, 1);
                     }
-                    ++bcIdx;
+                    break;
                 }
-                break;
 
-            // ------------------------------------------------------------
-            // Vector Arithmetic
-            // ------------------------------------------------------------
-
-            case Opcode::VADD:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vaddpd(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            case Opcode::VSUB:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vsubpd(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            case Opcode::VMUL:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vmulpd(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            case Opcode::VDIV:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vdivpd(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            case Opcode::VMIN:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vminpd(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            case Opcode::VMAX:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vmaxpd(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            // ------------------------------------------------------------
-            // Vector Filter
-            // ------------------------------------------------------------
-
-            case Opcode::VFILTER:
-                {
-                    u8 mode = imm12 & 0x7;
-                    loadVectorReg(ra, 0);
-                    loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                    a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
+                case Opcode::VSPLAT: {
+                    u8 g = getScalar(ra);
+                    a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, g);
                     a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
-                    a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-
-                    static const u8 cmpMap[6] = {0, 4, 1, 2, 14, 13};
-                    u8 pred = (mode < 6) ? cmpMap[mode] : 0;
-
-                    a.Vcmppd(2, 0, 1, pred);
-                    a.Vpand(0, 0, 2);
-                    storeVectorReg(rd, 0, bcIdx);
-                    ++bcIdx;
+                    a.Vbroadcastsd(0, static_cast<u8>(Reg64::RAX));
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
                 }
-                break;
 
-            case Opcode::VFILTER_EQ:
-                loadVectorReg(ra, 0);
-                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
-                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
-                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                a.Vcmppd(2, 0, 1, 0);
-                a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
+                case Opcode::VFILTER_GT: {
+                    if (ymmHolds != ra) {
+                        a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                        static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    }
+                    i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(rb) * 8);
+                    a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), off);
+                    a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
+                    a.Vcmppd(2, 0, 1, 14);
+                    a.Vpand(0, 0, 2);
+                    ymmHolds = rd;
+                    break;
+                }
 
-            case Opcode::VFILTER_NE:
-                loadVectorReg(ra, 0);
-                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
-                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
-                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                a.Vcmppd(2, 0, 1, 4);
-                a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
+                case Opcode::VSUM: {
+                    if (ymmHolds != ra) {
+                        a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                        static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    }
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
+                    a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
+                    a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
+                    a.Vaddsd(0, 0, 1);
+                    a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
+                    a.Vaddsd(0, 0, 1);
+                    a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
+                    a.Vaddsd(0, 0, 1);
+                    a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
+                    putScalar(rd, static_cast<u8>(Reg64::RAX));
+                    ymmHolds = VEC_NONE;
+                    break;
+                }
 
-            case Opcode::VFILTER_LT:
-                loadVectorReg(ra, 0);
-                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
-                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
-                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                a.Vcmppd(2, 0, 1, 1);
-                a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
+                case Opcode::VADD: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vaddpd(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            case Opcode::VFILTER_LE:
-                loadVectorReg(ra, 0);
-                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
-                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
-                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                a.Vcmppd(2, 0, 1, 2);
-                a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
+                case Opcode::VSUB: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vsubpd(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            case Opcode::VFILTER_GT:
-                loadVectorReg(ra, 0);
-                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
-                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
-                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                a.Vcmppd(2, 0, 1, 14);
-                a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
+                case Opcode::VMUL: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vmulpd(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            case Opcode::VFILTER_GE:
-                loadVectorReg(ra, 0);
-                loadScalarReg(rb, static_cast<u8>(Reg64::RAX));
-                a.MovMemReg(static_cast<u8>(Reg64::RBP), -48, static_cast<u8>(Reg64::RAX));
-                a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::RBP), -48);
-                a.Vbroadcastsd(1, static_cast<u8>(Reg64::RAX));
-                a.Vcmppd(2, 0, 1, 13);
-                a.Vpand(0, 0, 2);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
+                case Opcode::VMIN: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vminpd(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            case Opcode::VBLEND:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                loadVectorReg(0, 2); // use mask from vector 0 → actually need proper mask setup
-                a.Vblendvpd(0, 0, 1, 2);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
+                case Opcode::VMAX: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vmaxpd(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            // ------------------------------------------------------------
-            // Vector Reduction
-            // ------------------------------------------------------------
+                case Opcode::VAND: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vpand(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            case Opcode::VSUM:
-                loadVectorReg(ra, 0);
-                a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
-                a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
-                a.Vaddsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
-                a.Vaddsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
-                a.Vaddsd(0, 0, 1);
-                a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+                case Opcode::VOR: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vpor(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            case Opcode::VPROD:
-                loadVectorReg(ra, 0);
-                a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
-                a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
-                a.Vmulsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
-                a.Vmulsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
-                a.Vmulsd(0, 0, 1);
-                a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+                case Opcode::VXOR: {
+                    a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
+                    a.VmovupdYmmMem(1, static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rb) * kVectorStride));
+                    a.Vpxor(0, 0, 1);
+                    a.VmovupdMemYmm(static_cast<u8>(Reg64::R14),
+                                    static_cast<i32>(kVectorRegOffset + static_cast<sz>(rd) * kVectorStride), 0);
+                    break;
+                }
 
-            case Opcode::VRED_MIN:
-                loadVectorReg(ra, 0);
-                a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
-                a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
-                a.Vminsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
-                a.Vminsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
-                a.Vminsd(0, 0, 1);
-                a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+                default:
+                    break;
+                }
+            }
 
-            case Opcode::VRED_MAX:
-                loadVectorReg(ra, 0);
-                a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
-                a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
-                a.Vmaxsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
-                a.Vmaxsd(0, 0, 1);
-                a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
-                a.Vmaxsd(0, 0, 1);
-                a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
+            // Store liveOut values at block end (before branch/halt)
+            for (int r = 0; r < 16; ++r) {
+                if (b.liveOut.test(r) && alloc.gprForReg[r] != REG_NONE) {
+                    i32 off = static_cast<i32>(kScalarRegOffset + static_cast<sz>(r) * 8);
+                    a.MovMemReg(static_cast<u8>(Reg64::R14), off, alloc.gprForReg[r]);
+                }
+            }
 
-            // ------------------------------------------------------------
-            // Vector Logical
-            // ------------------------------------------------------------
+            // Handle the terminal instruction of the block
+            u8 termOp = static_cast<u8>(bytecode[b.end] & 0xFF);
+            u16 termImm12 = static_cast<u16>((bytecode[b.end] >> 20) & 0xFFF);
 
-            case Opcode::VAND:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vpand(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            case Opcode::VOR:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vpor(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            case Opcode::VXOR:
-                loadVectorReg(ra, 0);
-                loadVectorReg(rb, 1);
-                a.Vpxor(0, 0, 1);
-                storeVectorReg(rd, 0, bcIdx);
-                ++bcIdx;
-                break;
-
-            // ------------------------------------------------------------
-            // Aggregate — fallback to simple scalar
-            // ------------------------------------------------------------
-
-            case Opcode::AGG_COUNT:
-            case Opcode::AGG_SUM:
-            case Opcode::AGG_AVG:
-            case Opcode::AGG_MIN:
-            case Opcode::AGG_MAX:
-            case Opcode::AGG_FIRST:
-            case Opcode::AGG_LAST:
-                a.MovRegImm(static_cast<u8>(Reg64::RAX), 0);
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            // ------------------------------------------------------------
-            // Conversion
-            // ------------------------------------------------------------
-
-            case Opcode::CVT_I64:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::CVT_F64:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            case Opcode::BITCAST:
-                loadScalarReg(ra, static_cast<u8>(Reg64::RAX));
-                storeScalarReg(rd, static_cast<u8>(Reg64::RAX));
-                ++bcIdx;
-                break;
-
-            // ------------------------------------------------------------
-            // Default — NOP for unimplemented
-            // ------------------------------------------------------------
-
-            default:
-                ++bcIdx;
-                break;
+            if (termOp == 0x50) {
+                // JMP
+                i32 rel = immAsRel(termImm12);
+                sz target = static_cast<sz>(static_cast<isz>(b.end) + rel);
+                a.JmpRel32(0);
+                patches.push_back(BranchPatch(a.CurrentOffset - 4, target));
+            } else if (termOp == 0x51) {
+                // JZ
+                i32 rel = immAsRel(termImm12);
+                sz target = static_cast<sz>(static_cast<isz>(b.end) + rel);
+                a.JzRel32(0);
+                patches.push_back(BranchPatch(a.CurrentOffset - 4, target));
+                // Write stop byte (JMP to fallthrough 2 bytes, will get patched)
+            } else if (termOp == 0x52) {
+                // JNZ
+                i32 rel = immAsRel(termImm12);
+                sz target = static_cast<sz>(static_cast<isz>(b.end) + rel);
+                a.JnzRel32(0);
+                patches.push_back(BranchPatch(a.CurrentOffset - 4, target));
+            } else if (termOp == 0x59) {
+                // JL
+                i32 rel = immAsRel(termImm12);
+                sz target = static_cast<sz>(static_cast<isz>(b.end) + rel);
+                a.JlRel32(0);
+                patches.push_back(BranchPatch(a.CurrentOffset - 4, target));
+            } else if (termOp == 0x5A) {
+                // JLE
+                i32 rel = immAsRel(termImm12);
+                sz target = static_cast<sz>(static_cast<isz>(b.end) + rel);
+                a.JleRel32(0);
+                patches.push_back(BranchPatch(a.CurrentOffset - 4, target));
+            } else if (termOp == 0x5B) {
+                // JG
+                i32 rel = immAsRel(termImm12);
+                sz target = static_cast<sz>(static_cast<isz>(b.end) + rel);
+                a.JgRel32(0);
+                patches.push_back(BranchPatch(a.CurrentOffset - 4, target));
+            } else if (termOp == 0x5C) {
+                // JGE
+                i32 rel = immAsRel(termImm12);
+                sz target = static_cast<sz>(static_cast<isz>(b.end) + rel);
+                a.JgeRel32(0);
+                patches.push_back(BranchPatch(a.CurrentOffset - 4, target));
+            } else if (termOp == 0x01 || termOp == 0x5E) {
+                // HALT or RET — jump to epilogue
+                a.JmpRel32(0);
+                haltPatches.push_back(a.CurrentOffset - 4);
             }
         }
 
         // ------------------------------------------------------------
-        // Resolve branch patches
+        // doneTranslating: resolve patches, epilogue, JIT allocation
         // ------------------------------------------------------------
-    doneTranslating:
-        flushScalars();
+        sz epilogueStart = a.CurrentOffset;
         for (auto& p : patches) {
-            auto it = bcToCode.find(p.bcIndex);
-            if (it != bcToCode.end()) {
+            auto it = bcToCode2.find(p.bcIndex);
+            if (it != bcToCode2.end()) {
                 a.PatchBranch(p.codeOffset, static_cast<i32>(it->second));
             }
+        }
+        for (sz off : haltPatches) {
+            a.PatchBranch(off, static_cast<i32>(epilogueStart));
         }
 
         // ------------------------------------------------------------
