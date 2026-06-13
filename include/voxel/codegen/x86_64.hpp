@@ -855,9 +855,9 @@ public:
 
     void Vextractf128(u8 xdst, u8 ysrc, u8 imm8)
     {
-        EmitVEX3(1, 1, 0, (xdst < 8), true, (ysrc < 8), 0x03, false);
+        EmitVEX3(1, 1, ysrc, (xdst < 8), true, (xdst < 8), 0x03, false);
         EmitByte(0x19);
-        EmitModRM(3, xdst & 7, ysrc & 7);
+        EmitModRM(3, 0, xdst & 7);
         EmitByte(imm8);
     }
 
@@ -1696,13 +1696,11 @@ public:
                         a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R14),
                                         static_cast<i32>(kVectorRegOffset + static_cast<sz>(ra) * kVectorStride));
                     }
-                    a.VmovupdMemYmm(static_cast<u8>(Reg64::RBP), -80, 0);
-                    a.MovsdXmmMem(0, static_cast<u8>(Reg64::RBP), -80);
-                    a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -72);
-                    a.Vaddsd(0, 0, 1);
-                    a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -64);
-                    a.Vaddsd(0, 0, 1);
-                    a.MovsdXmmMem(1, static_cast<u8>(Reg64::RBP), -56);
+                    a.Vextractf128(1, 0, 1);
+                    a.Vmovhlps(2, 0, 0);
+                    a.Vaddsd(0, 0, 2);
+                    a.Vmovhlps(2, 1, 1);
+                    a.Vaddsd(1, 1, 2);
                     a.Vaddsd(0, 0, 1);
                     a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 0);
                     putScalar(rd, static_cast<u8>(Reg64::RAX));
