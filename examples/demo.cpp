@@ -647,6 +647,92 @@ int main()
         }
     }
 
+    // 23. Mixed Filter+Aggregate — filter then GROUP BY
+    {
+        constexpr sz N2 = 1'000'000;
+        std::vector<u32> groups(N2);
+        std::vector<f64> values(N2);
+        std::mt19937_64 rng2(123);
+        std::uniform_real_distribution<f64> dist2(0.0, 1000.0);
+        f64 groundSum[10] = {};
+        sz  groundCnt[10] = {};
+        for (sz i = 0; i < N2; ++i) {
+            groups[i] = i % 10;
+            values[i] = dist2(rng2);
+            if (values[i] > kThreshold) { groundSum[groups[i]] += values[i]; groundCnt[groups[i]]++; }
+        }
+
+        for (int run = 0; run < 5; ++run) {
+            Arena arena;
+            ops::HashAggregator<u32, f64> agg(arena);
+            agg.Init(128);
+            auto t0 = std::chrono::high_resolution_clock::now();
+            for (sz i = 0; i < N2; ++i)
+                if (values[i] > kThreshold) agg.Accumulate(&groups[i], &values[i], 1);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            if (run == 2) {
+                bool pass = (agg.GroupCount() == 10);
+                results.push_back(MakeResult("Mixed Filter+Aggregate", us,
+                    static_cast<f64>(N2) / us, "M rows/s", pass,
+                    "Filter 1M rows > 500, hash aggregate into 10 groups"));
+            }
+        }
+    }
+
+    // 24. Sort+TopK — sort 1M values, extract top 100
+    {
+        std::vector<f64> data2(N);
+        { std::mt19937_64 rngSort(42); std::uniform_real_distribution<f64> distSort(0.0, 1000.0); for (sz i = 0; i < N; ++i) data2[i] = distSort(rngSort); }
+        std::vector<f64> expected = data2;
+        std::sort(expected.begin(), expected.end(), std::greater<f64>());
+
+        for (int run = 0; run < 5; ++run) {
+            std::vector<f64> work = data2;
+            auto t0 = std::chrono::high_resolution_clock::now();
+            std::sort(work.begin(), work.end(), std::greater<f64>());
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            if (run == 2) {
+                bool pass = true;
+                for (int k = 0; k < 100; ++k)
+                    if (std::fabs(work[k] - expected[k]) > 1e-6) { pass = false; break; }
+                results.push_back(MakeResult("Sort+TopK", us,
+                    static_cast<f64>(N) / us, "M elem/s", pass,
+                    "Sort 1M f64 descending, extract top 100"));
+            }
+        }
+    }
+
+    // 25. Join+Aggregate — hash join then aggregate
+    {
+        constexpr sz leftN = 100'000, rightN = 10'000;
+        std::vector<u32> leftKeys(leftN), rightKeys(rightN);
+        std::vector<f64> leftVals(leftN);
+        std::mt19937_64 rng3(456);
+        for (sz i = 0; i < leftN; ++i)  { leftKeys[i] = i % rightN; leftVals[i] = 100.0 + (i % 10); }
+        for (sz i = 0; i < rightN; ++i) rightKeys[i] = i;
+
+        for (int run = 0; run < 5; ++run) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            Arena jArena; ops::HashJoin<u32> join(jArena);
+            join.Build(rightKeys.data(), rightN);
+            sz matchCount = 0;
+            f64 joinSum = 0;
+            for (sz i = 0; i < leftN; ++i) {
+                if (join.Contains(leftKeys[i])) { matchCount++; joinSum += leftVals[i]; }
+            }
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            if (run == 2) {
+                bool pass = (matchCount == leftN);
+                results.push_back(MakeResult("Join+Aggregate", us,
+                    static_cast<f64>(leftN) / us, "M rows/s", pass,
+                    "Hash join 100K left keys against 10K right keys, sum matched values"));
+            }
+        }
+    }
+
     // ================================================================
     // SUMMARY TABLE
     // ================================================================
