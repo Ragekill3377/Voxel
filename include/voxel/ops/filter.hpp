@@ -6,6 +6,7 @@
 #include <limits>
 #include <algorithm>
 #include <vector>
+#include <xmmintrin.h>
 
 namespace voxel {
 namespace ops {
@@ -48,6 +49,10 @@ public:
         (void)processed;
 
         for (sz base = 0; base < count; base += kChunkSize) {
+            sz nextBase = base + kChunkSize;
+            if (nextBase < count) {
+                _mm_prefetch((const char*)(data + nextBase), _MM_HINT_T0);
+            }
             sz chunkEnd = std::min(base + kChunkSize, count);
             u64 word[kWordsPerChunk] = {};
 
@@ -80,6 +85,10 @@ public:
         u64* VOXEL_RESTRICT bitmap = result.Bitmap.data();
 
         for (sz base = 0; base < count; base += kChunkSize) {
+            sz nextBase = base + kChunkSize;
+            if (nextBase < count) {
+                _mm_prefetch((const char*)(data + nextBase), _MM_HINT_T0);
+            }
             sz chunkEnd = std::min(base + kChunkSize, count);
             u64 word[kWordsPerChunk] = {};
 
@@ -111,6 +120,10 @@ public:
         u64* VOXEL_RESTRICT bitmap = result.Bitmap.data();
 
         for (sz base = 0; base < count; base += kChunkSize) {
+            sz nextBase = base + kChunkSize;
+            if (nextBase < count) {
+                _mm_prefetch((const char*)(data + nextBase), _MM_HINT_T0);
+            }
             sz chunkEnd = std::min(base + kChunkSize, count);
             u64 word[kWordsPerChunk] = {};
 
@@ -142,6 +155,10 @@ public:
         u64* VOXEL_RESTRICT bitmap = result.Bitmap.data();
 
         for (sz base = 0; base < count; base += kChunkSize) {
+            sz nextBase = base + kChunkSize;
+            if (nextBase < count) {
+                _mm_prefetch((const char*)(data + nextBase), _MM_HINT_T0);
+            }
             sz chunkEnd = std::min(base + kChunkSize, count);
             u64 word[kWordsPerChunk] = {};
 
@@ -173,6 +190,10 @@ public:
         u64* VOXEL_RESTRICT bitmap = result.Bitmap.data();
 
         for (sz base = 0; base < count; base += kChunkSize) {
+            sz nextBase = base + kChunkSize;
+            if (nextBase < count) {
+                _mm_prefetch((const char*)(data + nextBase), _MM_HINT_T0);
+            }
             sz chunkEnd = std::min(base + kChunkSize, count);
             u64 word[kWordsPerChunk] = {};
 
@@ -204,6 +225,10 @@ public:
         u64* VOXEL_RESTRICT bitmap = result.Bitmap.data();
 
         for (sz base = 0; base < count; base += kChunkSize) {
+            sz nextBase = base + kChunkSize;
+            if (nextBase < count) {
+                _mm_prefetch((const char*)(data + nextBase), _MM_HINT_T0);
+            }
             sz chunkEnd = std::min(base + kChunkSize, count);
             u64 word[kWordsPerChunk] = {};
 
@@ -235,6 +260,10 @@ public:
         u64* VOXEL_RESTRICT bitmap = result.Bitmap.data();
 
         for (sz base = 0; base < count; base += kChunkSize) {
+            sz nextBase = base + kChunkSize;
+            if (nextBase < count) {
+                _mm_prefetch((const char*)(data + nextBase), _MM_HINT_T0);
+            }
             sz chunkEnd = std::min(base + kChunkSize, count);
             u64 word[kWordsPerChunk] = {};
 
