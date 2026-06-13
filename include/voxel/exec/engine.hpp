@@ -59,6 +59,10 @@ public:
         ResetHashTables();
     }
 
+    void ReuseArena() {
+        Arena_.SoftReset();
+    }
+
     VOXEL_HOT VOXEL_FLATTEN
     void Run() {
         while (VOXEL_LIKELY(PC_ < Code_.size())) {

@@ -71,15 +71,16 @@ inline f64 WelfordPopulationStdDev(const WelfordState& s) {
 template<typename TKey, typename TValue>
 class HashAggregator {
 public:
+    static constexpr u8 kMaxProbeDistance = 128;
+
     struct AggregateState {
+        // Trivially constructible — memset-safe for HashEntry arrays
         TValue Sum;
         TValue Min;
         TValue Max;
         sz     Count;
         f64    M2;
         f64    Mean;
-
-        AggregateState() : Sum{}, Min{}, Max{}, Count(0), M2(0.0), Mean(0.0) {}
 
         void Init(TValue firstValue) {
             Sum   = firstValue;
@@ -140,14 +141,13 @@ public:
 
     struct HashEntry {
         TKey           Key;
-        AggregateState State;
         u64            Hash;
-        HashEntry*     Next;
+        AggregateState State;
+        u8             ProbeDistance;
     };
 
     HashAggregator(Arena& arena)
-        : Table_(nullptr), TableSize_(0), EntryCount_(0),
-          EntryArena_(nullptr), EntryLimit_(nullptr), EntryCursor_(nullptr),
+        : Entries_(nullptr), TableSize_(0), EntryCount_(0),
           Arena_(arena), LoadFactorLimit_(0.75)
     {}
 
@@ -158,15 +158,9 @@ public:
 
     void Init(sz expectedGroups) {
         TableSize_ = NextPowerOfTwo(std::max(expectedGroups * 2, static_cast<sz>(16)));
-        sz tableBytes = TableSize_ * sizeof(HashEntry*);
-        Table_ = static_cast<HashEntry**>(Arena_.Alloc(tableBytes));
-        std::memset(Table_, 0, tableBytes);
-
-        sz entryBytes = expectedGroups * sizeof(HashEntry);
-        EntryArena_ = static_cast<HashEntry*>(Arena_.Alloc(entryBytes));
-        EntryLimit_ = EntryArena_ + expectedGroups;
-        EntryCursor_ = EntryArena_;
-
+        sz tableBytes = TableSize_ * sizeof(HashEntry);
+        Entries_ = static_cast<HashEntry*>(Arena_.Alloc(tableBytes));
+        std::memset(Entries_, 0, tableBytes);
         EntryCount_ = 0;
         LoadFactorLimit_ = 0.75;
     }
@@ -181,84 +175,87 @@ public:
 
     VOXEL_HOT void AccumulateOne(TKey key, TValue value) {
         u64 h = HashValue(key);
+        if (h == 0) h = 1;
 
-        sz slot = static_cast<sz>(h & (static_cast<u64>(TableSize_) - 1));
-        HashEntry* entry = Table_[slot];
+        sz mask = TableSize_ - 1;
+        sz slot = h & mask;
+        u8 dist = 0;
 
-        while (entry) {
-            if (entry->Hash == h && entry->Key == key) {
-                entry->State.Update(value);
+        while (true) {
+            VOXEL_PREFETCH(&Entries_[(slot + 1) & mask]);
+
+            if (Entries_[slot].Hash == 0) break;
+            if (Entries_[slot].ProbeDistance < dist) break;
+            if (Entries_[slot].Hash == h && Entries_[slot].Key == key) {
+                Entries_[slot].State.Update(value);
                 return;
             }
-            entry = entry->Next;
+            ++dist;
+            slot = (slot + 1) & mask;
+            if (VOXEL_UNLIKELY(dist >= kMaxProbeDistance)) {
+                Grow();
+                AccumulateOne(key, value);
+                return;
+            }
         }
 
-        if (EntryCursor_ >= EntryLimit_) {
+        if (EntryCount_ + 1 > static_cast<sz>(static_cast<f64>(TableSize_) * LoadFactorLimit_)) {
             Grow();
-            slot = static_cast<sz>(h & (static_cast<u64>(TableSize_) - 1));
+            AccumulateOne(key, value);
+            return;
         }
 
-        HashEntry* newEntry = EntryCursor_++;
-        newEntry->Key  = key;
-        newEntry->Hash = h;
-        newEntry->Next = Table_[slot];
-        newEntry->State.Init(value);
-        Table_[slot] = newEntry;
-        ++EntryCount_;
+        dist = 0;
+        slot = h & mask;
+
+        TKey curKey = key;
+        u64 curHash = h;
+        AggregateState curState;
+        curState.Init(value);
+
+        while (dist < kMaxProbeDistance) {
+            if (Entries_[slot].Hash == 0) {
+                Entries_[slot].Key = curKey;
+                Entries_[slot].Hash = curHash;
+                Entries_[slot].State = curState;
+                Entries_[slot].ProbeDistance = dist;
+                ++EntryCount_;
+                return;
+            }
+
+            if (dist > Entries_[slot].ProbeDistance) {
+                std::swap(curKey, Entries_[slot].Key);
+                std::swap(curHash, Entries_[slot].Hash);
+                std::swap(curState, Entries_[slot].State);
+                std::swap(dist, Entries_[slot].ProbeDistance);
+            }
+
+            ++dist;
+            slot = (slot + 1) & mask;
+        }
+
+        Grow();
+        AccumulateOne(key, value);
     }
 
     void Merge(const HashAggregator& other) {
         for (sz slot = 0; slot < other.TableSize_; ++slot) {
-            HashEntry* entry = other.Table_[slot];
-            while (entry) {
-                u64 h = entry->Hash;
-                sz mySlot = static_cast<sz>(h & (static_cast<u64>(TableSize_) - 1));
-
-                HashEntry* existing = Table_[mySlot];
-                HashEntry* found = nullptr;
-                while (existing) {
-                    if (existing->Hash == h && existing->Key == entry->Key) {
-                        found = existing;
-                        break;
-                    }
-                    existing = existing->Next;
-                }
-
-                if (found) {
-                    found->State.Merge(entry->State);
-                } else {
-                    if (EntryCursor_ >= EntryLimit_) {
-                        Grow();
-                        mySlot = static_cast<sz>(h & (static_cast<u64>(TableSize_) - 1));
-                    }
-
-                    HashEntry* newEntry = EntryCursor_++;
-                    newEntry->Key  = entry->Key;
-                    newEntry->Hash = h;
-                    newEntry->Next = Table_[mySlot];
-                    newEntry->State = entry->State;
-                    Table_[mySlot] = newEntry;
-                    ++EntryCount_;
-                }
-                entry = entry->Next;
-            }
+            const HashEntry& e = other.Entries_[slot];
+            if (e.Hash == 0) continue;
+            MergeOne(e.Key, e.State);
         }
     }
 
     void Finalize(TKey* VOXEL_RESTRICT outKeys,
-                  TValue* VOXEL_RESTRICT outSums,
-                  sz* VOXEL_RESTRICT outCounts,
+                  AggregateState* VOXEL_RESTRICT outStates,
                   sz maxGroups) {
         sz written = 0;
 
         for (sz slot = 0; slot < TableSize_ && written < maxGroups; ++slot) {
-            HashEntry* entry = Table_[slot];
-            while (entry && written < maxGroups) {
-                outKeys[written]   = entry->Key;
-                outSums[written]   = entry->State.Sum;
-                outCounts[written] = entry->State.Count;
+            if (Entries_[slot].Hash != 0) {
+                outKeys[written]   = Entries_[slot].Key;
+                outStates[written] = Entries_[slot].State;
                 ++written;
-                entry = entry->Next;
             }
         }
     }
@@ -266,39 +263,38 @@ public:
     sz GroupCount() const { return EntryCount_; }
 
     AggregateState* Lookup(TKey key) const {
-        if (!Table_) return nullptr;
+        if (!Entries_ || TableSize_ == 0) return nullptr;
 
         u64 h = HashValue(key);
-        sz slot = static_cast<sz>(h & (static_cast<u64>(TableSize_) - 1));
+        if (h == 0) h = 1;
 
-        HashEntry* entry = Table_[slot];
-        while (entry) {
-            if (entry->Hash == h && entry->Key == key)
-                return &entry->State;
-            entry = entry->Next;
+        sz mask = TableSize_ - 1;
+        sz slot = h & mask;
+        u8 dist = 0;
+
+        while (true) {
+            if (Entries_[slot].Hash == 0) return nullptr;
+            if (Entries_[slot].ProbeDistance < dist) return nullptr;
+            if (Entries_[slot].Hash == h && Entries_[slot].Key == key)
+                return &Entries_[slot].State;
+            ++dist;
+            slot = (slot + 1) & mask;
         }
-        return nullptr;
     }
 
     void Clear() {
-        if (Table_ && TableSize_ > 0) {
-            std::memset(Table_, 0, TableSize_ * sizeof(HashEntry*));
+        if (Entries_ && TableSize_ > 0) {
+            std::memset(Entries_, 0, TableSize_ * sizeof(HashEntry));
         }
         EntryCount_ = 0;
-        EntryCursor_ = EntryArena_;
     }
 
 private:
-    HashEntry** Table_;
-    sz          TableSize_;
-    sz          EntryCount_;
-
-    HashEntry*  EntryArena_;
-    HashEntry*  EntryLimit_;
-    HashEntry*  EntryCursor_;
-
-    Arena&      Arena_;
-    f64         LoadFactorLimit_;
+    HashEntry* Entries_;
+    sz         TableSize_;
+    sz         EntryCount_;
+    Arena&     Arena_;
+    f64        LoadFactorLimit_;
 
     static sz NextPowerOfTwo(sz v) {
         v--;
@@ -313,41 +309,107 @@ private:
 
     VOXEL_NOINLINE void Grow() {
         sz oldSize = TableSize_;
-        HashEntry** oldTable = Table_;
+        HashEntry* oldEntries = Entries_;
 
         sz newSize = std::max(oldSize * 2, static_cast<sz>(16));
-        sz newTableBytes = newSize * sizeof(HashEntry*);
-        Table_ = static_cast<HashEntry**>(Arena_.Alloc(newTableBytes));
-        std::memset(Table_, 0, newTableBytes);
+        sz newBytes = newSize * sizeof(HashEntry);
+        Entries_ = static_cast<HashEntry*>(Arena_.Alloc(newBytes));
+        std::memset(Entries_, 0, newBytes);
         TableSize_ = newSize;
 
-        sz newEntryCount = EntryCount_ * 2;
-        sz newEntryBytes = newEntryCount * sizeof(HashEntry);
-        HashEntry* newArena = static_cast<HashEntry*>(Arena_.Alloc(newEntryBytes));
-        EntryLimit_ = newArena + newEntryCount;
-        EntryCursor_ = newArena;
+        for (sz i = 0; i < oldSize; ++i) {
+            if (oldEntries[i].Hash == 0) continue;
 
-        sz rehashed = 0;
-        for (sz slot = 0; slot < oldSize; ++slot) {
-            HashEntry* entry = oldTable[slot];
-            while (entry) {
-                HashEntry* next = entry->Next;
+            u64 h = oldEntries[i].Hash;
+            sz slot = h & (newSize - 1);
+            u8 dist = 0;
 
-                sz newSlot = static_cast<sz>(entry->Hash & (static_cast<u64>(newSize) - 1));
+            TKey key = oldEntries[i].Key;
+            u64 curHash = h;
+            AggregateState curState = oldEntries[i].State;
 
-                HashEntry* newEntry = EntryCursor_++;
-                newEntry->Key   = entry->Key;
-                newEntry->Hash  = entry->Hash;
-                newEntry->State = entry->State;
-                newEntry->Next  = Table_[newSlot];
-                Table_[newSlot] = newEntry;
-                ++rehashed;
+            while (dist < kMaxProbeDistance) {
+                if (Entries_[slot].Hash == 0) {
+                    Entries_[slot].Key = key;
+                    Entries_[slot].Hash = curHash;
+                    Entries_[slot].State = curState;
+                    Entries_[slot].ProbeDistance = dist;
+                    break;
+                }
 
-                entry = next;
+                if (dist > Entries_[slot].ProbeDistance) {
+                    std::swap(key, Entries_[slot].Key);
+                    std::swap(curHash, Entries_[slot].Hash);
+                    std::swap(curState, Entries_[slot].State);
+                    std::swap(dist, Entries_[slot].ProbeDistance);
+                }
+
+                ++dist;
+                slot = (slot + 1) & (newSize - 1);
+            }
+        }
+    }
+
+    void MergeOne(TKey key, const AggregateState& state) {
+        u64 h = HashValue(key);
+        if (h == 0) h = 1;
+
+        sz mask = TableSize_ - 1;
+        sz slot = h & mask;
+        u8 dist = 0;
+
+        while (true) {
+            if (Entries_[slot].Hash == 0) break;
+            if (Entries_[slot].ProbeDistance < dist) break;
+            if (Entries_[slot].Hash == h && Entries_[slot].Key == key) {
+                Entries_[slot].State.Merge(state);
+                return;
+            }
+            ++dist;
+            slot = (slot + 1) & mask;
+            if (VOXEL_UNLIKELY(dist >= kMaxProbeDistance)) {
+                Grow();
+                MergeOne(key, state);
+                return;
             }
         }
 
-        EntryArena_ = newArena;
+        if (EntryCount_ + 1 > static_cast<sz>(static_cast<f64>(TableSize_) * LoadFactorLimit_)) {
+            Grow();
+            MergeOne(key, state);
+            return;
+        }
+
+        dist = 0;
+        slot = h & mask;
+
+        TKey curKey = key;
+        u64 curHash = h;
+        AggregateState curState = state;
+
+        while (dist < kMaxProbeDistance) {
+            if (Entries_[slot].Hash == 0) {
+                Entries_[slot].Key = curKey;
+                Entries_[slot].Hash = curHash;
+                Entries_[slot].State = curState;
+                Entries_[slot].ProbeDistance = dist;
+                ++EntryCount_;
+                return;
+            }
+
+            if (dist > Entries_[slot].ProbeDistance) {
+                std::swap(curKey, Entries_[slot].Key);
+                std::swap(curHash, Entries_[slot].Hash);
+                std::swap(curState, Entries_[slot].State);
+                std::swap(dist, Entries_[slot].ProbeDistance);
+            }
+
+            ++dist;
+            slot = (slot + 1) & mask;
+        }
+
+        Grow();
+        MergeOne(key, state);
     }
 };
 
@@ -665,7 +727,15 @@ public:
                   sz* VOXEL_RESTRICT outCounts,
                   sz maxGroups) {
         if (UseHash_) {
-            HashAgg_.Finalize(outKeys, outSums, outCounts, maxGroups);
+            sz n = std::min(HashAgg_.GroupCount(), maxGroups);
+            typename HashAggregator<TKey, TValue>::AggregateState* states =
+                static_cast<typename HashAggregator<TKey, TValue>::AggregateState*>(
+                    Arena_.Alloc(n * sizeof(typename HashAggregator<TKey, TValue>::AggregateState)));
+            HashAgg_.Finalize(outKeys, states, n);
+            for (sz i = 0; i < n; ++i) {
+                outSums[i] = states[i].Sum;
+                outCounts[i] = states[i].Count;
+            }
         }
     }
 

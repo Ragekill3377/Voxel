@@ -108,6 +108,19 @@ public:
         Metrics_.CacheLineMisaligned.store(0, std::memory_order_relaxed);
     }
 
+    void SoftReset() {
+        if (ThreadSafe_) std::lock_guard<std::mutex> lock(Mutex_);
+        if (Blocks_.empty()) return;
+        Bump_ = Blocks_[0].Memory;
+        Limit_ = Bump_ + Blocks_[0].Size;
+        Metrics_.TotalAllocated.store(0, std::memory_order_relaxed);
+        Metrics_.PeakAllocated.store(0, std::memory_order_relaxed);
+        Metrics_.AllocationCount.store(0, std::memory_order_relaxed);
+        Metrics_.BlockCount.store(0, std::memory_order_relaxed);
+        Metrics_.ReallocationCount.store(0, std::memory_order_relaxed);
+        Metrics_.CacheLineMisaligned.store(0, std::memory_order_relaxed);
+    }
+
     sz Used() const {
         sz total = 0;
         for (auto& b : Blocks_) total += b.Size;

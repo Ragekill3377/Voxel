@@ -1145,6 +1145,20 @@ public:
         EmitByte(0x90);
     }
 
+    void PrefetchT0(u8 base, i32 disp)
+    {
+        EmitREX(false, false, false, (base >= 8));
+        EmitByte(0x0F);
+        EmitByte(0x18);
+        if (disp >= -128 && disp <= 127) {
+            EmitModRM(1, 1, base & 7);
+            EmitByte(static_cast<u8>(disp & 0xFF));
+        } else {
+            EmitModRM(2, 1, base & 7);
+            EmitDWord(static_cast<u32>(disp));
+        }
+    }
+
     // ----------------------------------------------------------------
     // Test instruction
     // ----------------------------------------------------------------
@@ -1619,6 +1633,7 @@ public:
                     if (g != static_cast<u8>(Reg64::RAX)) a.MovRegReg(static_cast<u8>(Reg64::RAX), g);
                     a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
                     a.AddRegReg(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::RAX));
+                    a.PrefetchT0(static_cast<u8>(Reg64::R15), 64);
                     a.VmovupdYmmMem(0, static_cast<u8>(Reg64::R15), 0);
                     ymmHolds = rd;
                     if (count > 4) {
