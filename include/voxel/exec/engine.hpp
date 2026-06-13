@@ -7,6 +7,7 @@
 #include "voxel/bytecode/opcodes.hpp"
 #include "voxel/bytecode/instruction.hpp"
 #include "voxel/data/segment.hpp"
+#include "voxel/util/thread.hpp"
 #include <vector>
 #include <cmath>
 #include <bit>
@@ -70,6 +71,40 @@ public:
             sDispatch[static_cast<u8>(raw & 0xFF)](this, raw);
             if (VOXEL_UNLIKELY(!Running_)) break;
         }
+    }
+
+    void RunParallel(sz segId, u32 numThreads = 0, u8 resultReg = 0) {
+        if (numThreads == 0) numThreads = std::thread::hardware_concurrency();
+        if (numThreads < 1) numThreads = 1;
+        if (Segments_.empty() || segId >= Segments_.size()) return;
+
+        Segment<T>& seg = Segments_[segId];
+        sz totalCount = seg.Count;
+        sz chunkSize = (totalCount + numThreads - 1) / numThreads;
+
+        std::vector<Engine> workers(numThreads);
+
+        ThreadPool pool(numThreads);
+        for (u32 t = 0; t < numThreads; ++t) {
+            pool.Enqueue([&, t, chunkSize, totalCount]() {
+                sz start = t * chunkSize;
+                sz count = (start + chunkSize > totalCount) ? (totalCount - start) : chunkSize;
+                if (count == 0) return;
+
+                Engine& w = workers[t];
+                w.AddSegment(seg.Data + start, count);
+                w.LoadProgram(Code_);
+                for (sz r = 0; r < kScalarRegs; ++r) w.ScalarReg(r) = Regs_.Scalar(r);
+                w.Run();
+            });
+        }
+        pool.WaitAll();
+
+        T combined = T{};
+        for (u32 t = 0; t < numThreads; ++t)
+            if (workers[t].SegmentCount() > 0)
+                combined += workers[t].Regs_.template ScalarAs<T>(resultReg);
+        SetScalarT(resultReg, combined);
     }
 
 private:

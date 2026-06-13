@@ -733,8 +733,52 @@ int main()
         }
     }
 
-    // ================================================================
-    // SUMMARY TABLE
+    // 26. Parallel execution (data-parallel multi-threading)
+    {
+        std::vector<f64> pdata(N);
+        {
+            std::mt19937_64 rngP(42);
+            std::uniform_real_distribution<f64> distP(0.0, 1000.0);
+            for (sz i = 0; i < N; ++i) pdata[i] = distP(rngP);
+        }
+        constexpr f64 thresh = 500.0;
+        f64 pExpected = 0;
+        for (sz i = 0; i < N; ++i) if (pdata[i] > thresh) pExpected += pdata[i];
+
+        Engine<f64> pe;
+        pe.ScalarReg(0) = 0; pe.ScalarReg(1) = 0;
+        pe.ScalarReg(2) = N;
+        pe.ScalarReg(3) = std::bit_cast<u64>(thresh);
+        pe.ScalarReg(4) = static_cast<u64>(Engine<f64>::kLanes);
+        pe.AddSegment(pdata.data(), N);
+
+        std::vector<u32> code = {
+            Instruction::VLoad(0, 1, 0, 0).raw,
+            Instruction::VFilterGt(1, 0, 3).raw,
+            Instruction::VSum(5, 1).raw,
+            Instruction::Addf(0, 0, 5).raw,
+            Instruction::Add(1, 1, 4).raw,
+            Instruction::Cmp(1, 2).raw,
+            Instruction::Jnz(-6).raw,
+            Instruction::Halt().raw,
+        };
+        pe.LoadProgram(code);
+
+        for (int run = 0; run < 5; ++run) {
+            pe.ScalarReg(0) = 0; pe.ScalarReg(1) = 0;
+            auto t0 = std::chrono::high_resolution_clock::now();
+            pe.RunParallel(0, 0, 0);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+            if (run == 2) {
+                f64 res = std::bit_cast<f64>(pe.ScalarReg(0));
+                bool pass = std::fabs(res - pExpected) < pExpected * 1e-12;
+                results.push_back(MakeResult("Parallel Filter+Sum", us,
+                    static_cast<f64>(N) / us, "M elem/s", pass,
+                    "Data-parallel filter+sum on 1M f64 across CPU cores"));
+            }
+        }
+    }
     // ================================================================
     std::cout << "\n================================================================================\n";
     std::cout << "  BENCHMARK SUMMARY TABLE\n";
