@@ -855,7 +855,7 @@ public:
 
     void Vextractf128(u8 xdst, u8 ysrc, u8 imm8)
     {
-        EmitVEX3(1, 1, ysrc, (xdst < 8), true, (xdst < 8), 0x03, false);
+        EmitVEX3(1, 1, 0, (xdst < 8), true, (xdst < 8), 0x03, false);
         EmitByte(0x19);
         EmitModRM(3, 0, xdst & 7);
         EmitByte(imm8);
