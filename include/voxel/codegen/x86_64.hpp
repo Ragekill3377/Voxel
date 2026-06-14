@@ -848,7 +848,7 @@ public:
     void Vperm2f128(u8 dst, u8 a, u8 b, u8 imm8)
     {
         EmitVEX3(1, 1, a, (dst < 8), true, (b < 8), 0x03, false);
-        EmitByte(0x16);
+        EmitByte(0x06);
         EmitModRM(3, dst & 7, b & 7);
         EmitByte(imm8);
     }
