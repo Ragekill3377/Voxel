@@ -1,4 +1,7 @@
 #include "voxel/voxel.hpp"
+#include "voxel/data/mmap_segment.hpp"
+#include "voxel/core/chunked.hpp"
+#include "voxel/exec/streaming.hpp"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
@@ -183,6 +186,10 @@ PYBIND11_MODULE(voxel_py, m) {
             );
         });
 
+    // ---- Arena ----
+    py::class_<Arena>(m, "Arena")
+        .def(py::init<sz>(), py::arg("block_size") = 65536);
+
     // ---- HashAggregator ----
     py::class_<ops::HashAggregator<u32, f64>>(m, "HashAggregator")
         .def(py::init<Arena&>())
@@ -288,4 +295,30 @@ PYBIND11_MODULE(voxel_py, m) {
 
     // ---- Version ----
     m.attr("__version__") = "1.0.0";
+
+    // ---- MmapSegment (large data) ----
+    py::class_<MmapSegment<f64>>(m, "MmapSegment")
+        .def(py::init<const char*>())
+        .def("view", &MmapSegment<f64>::view)
+        .def("__len__", [](MmapSegment<f64>& s) { return s.size(); })
+        .def("valid", &MmapSegment<f64>::valid);
+
+    // ---- ChunkedReader (streaming large files) ----
+    py::class_<ChunkedReader<f64>>(m, "ChunkedReader")
+        .def(py::init<const char*, sz>(), py::arg("filepath"), py::arg("chunk_size") = 1000000);
+
+    // ---- StreamingEngine (real-time data feeds) ----
+    py::class_<StreamingEngine<f64>>(m, "StreamingEngine")
+        .def(py::init<sz>(), py::arg("batch_size") = 1024)
+        .def("feed", [](StreamingEngine<f64>& e, py::array_t<f64> arr) {
+            auto buf = arr.request();
+            e.Feed(static_cast<f64*>(buf.ptr), buf.size);
+        })
+        .def("flush", &StreamingEngine<f64>::Flush)
+        .def("get_result", [](StreamingEngine<f64>& e, u8 reg) {
+            return e.GetResult(reg);
+        }, py::arg("reg") = 0)
+        .def_property_readonly("engine", [](StreamingEngine<f64>& e) -> Engine<f64>& {
+            return e.GetEngine();
+        }, py::return_value_policy::reference);
 }

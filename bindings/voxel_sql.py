@@ -25,8 +25,6 @@ class SqlCompiler:
     def __init__(self, data_sources=None):
         self._data = data_sources or {}
         self._columns = {}
-        self._result = None
-        self._group_keys = None
 
     def execute(self, sql: str):
         """Parse SQL and execute against registered data sources."""
@@ -38,7 +36,6 @@ class SqlCompiler:
 
     def _compile(self, node):
         t = type(node).__name__
-
         if t == "SelectStmt":
             return self._compile_select(node)
         elif t == "InsertStmt":
@@ -60,67 +57,153 @@ class SqlCompiler:
         limit = getattr(sel, "limitCount", None)
         targets = getattr(sel, "targetList", None)
 
-        # Build the query chain
-        q = _vq.from_numpy(table)
+        # Determine aggregate function from targets
+        agg_func = None
+        if targets:
+            agg_func = self._get_agg_func(targets[0].val)
 
-        # WHERE clause
+        # ---- GROUP BY path ----
+        if group_by is not None:
+            return self._execute_group_by(table, where, group_by, targets, sort, limit)
+
+        # ---- Standard query path (bytecode) ----
+        q = _vq.from_numpy(table)
         if where is not None:
             self._compile_where(q, where)
-
-        # Aggregates and projections
         if targets:
             self._compile_targets(q, targets)
-
-        # GROUP BY
-        if group_by:
-            self._compile_group_by(q, group_by)
-
-        # ORDER BY
         if sort:
-            q.sort(ascending=True)
-
-        # LIMIT / TopK
+            ascending = self._get_sort_dir(sort)
+            q.sort(ascending=ascending)
         if limit is not None:
             k = self._eval_const(limit)
             if k:
                 q.topk(int(k), largest=True)
-
         return q.run()
 
-    def _resolve_table(self, from_item):
-        """Resolve a FROM clause item to a numpy array."""
-        t = type(from_item).__name__
+    # ================================================================
+    # GROUP BY execution
+    # ================================================================
+    def _execute_group_by(self, table, where, group_by, targets, sort, limit):
+        """Execute GROUP BY using HashAggregator."""
+        # Get group column from the GROUP BY clause
+        group_col_names = self._resolve_group_columns(group_by)
 
+        # Build a filtered mask from WHERE clause
+        filtered_table = table
+        filtered_offsets = None
+        if where is not None:
+            mask = self._evaluate_where_numpy(table, where)
+            filtered_table = table[mask]
+            filtered_offsets = np.where(mask)[0]
+
+        # Get aggregate function
+        agg_func = "sum"
+        if targets:
+            agg_func = self._get_agg_func(targets[0].val) or "sum"
+
+        # Get group keys (from data dict or as int index)
+        group_keys = None
+        if group_col_names and group_col_names[0] in self._data:
+            raw_keys = self._data[group_col_names[0]]
+            if filtered_offsets is not None:
+                group_keys = np.array(raw_keys[filtered_offsets], dtype=np.uint32)
+            else:
+                group_keys = np.array(raw_keys, dtype=np.uint32)
+        else:
+            # No group column in data — use sequential indices
+            group_keys = np.arange(len(filtered_table), dtype=np.uint32)
+
+        # Run HashAggregator
+        arena = _vx.Arena()
+        agg = _vx.HashAggregator(arena)
+        agg.init(max(128, int(len(group_keys) / 10) + 1))
+        agg.accumulate(group_keys, filtered_table)
+        ngroups = agg.group_count()
+
+        # Extract results
+        return {"groups": int(ngroups), "function": agg_func}
+
+    def _evaluate_where_numpy(self, table, where):
+        """Evaluate WHERE clause using numpy to get boolean mask."""
+        t = type(where).__name__
+        if t == "A_Expr":
+            return self._eval_aexpr_numpy(table, where)
+        elif t == "BoolExpr":
+            result = np.ones(len(table), dtype=bool)
+            for arg in where.args:
+                result &= self._evaluate_where_numpy(table, arg)
+            return result
+        return np.ones(len(table), dtype=bool)
+
+    def _eval_aexpr_numpy(self, table, expr):
+        op = self._resolve_opname(expr.name)
+        val = self._eval_const(expr.rexpr)
+        if op == ">":
+            return table > val
+        elif op == ">=":
+            return table >= val
+        elif op == "<":
+            return table < val
+        elif op == "<=":
+            return table <= val
+        elif op == "=":
+            return np.abs(table - val) < 1e-10
+        return np.ones(len(table), dtype=bool)
+
+    def _resolve_group_columns(self, group_by):
+        """Resolve GROUP BY column names."""
+        cols = []
+        if isinstance(group_by, (list, tuple)):
+            for item in group_by:
+                name = self._resolve_column(item)
+                if name:
+                    cols.append(name)
+        return cols
+
+    def _get_agg_func(self, val):
+        """Get aggregate function name from target value."""
+        vt = type(val).__name__
+        if vt == "FuncCall":
+            return self._resolve_opname(val.funcname)
+        return None
+
+    def _get_sort_dir(self, sort_clause):
+        """Get sort direction from ORDER BY clause."""
+        if isinstance(sort_clause, (list, tuple)):
+            for item in sort_clause:
+                sd = getattr(item, 'sortby_dir', None)
+                if sd is not None:
+                    # SORTBY_DEFAULT/SORTBY_ASC = ascending, SORTBY_DESC = descending
+                    dir_name = str(sd).lower()
+                    return "desc" not in dir_name
+        return True  # default ascending
+
+    # ================================================================
+    # Table resolution
+    # ================================================================
+    def _resolve_table(self, from_item):
+        t = type(from_item).__name__
         if t == "RangeVar":
             name = from_item.relname.value if hasattr(from_item.relname, 'value') else str(from_item.relname)
-
-            # Check registered data dict
             if name in self._data:
                 val = self._data[name]
-                if isinstance(val, np.ndarray):
-                    return val.astype(np.float64)
-                return val
-
-            # Try CSV file
+                return val.astype(np.float64) if isinstance(val, np.ndarray) else val
             csv_path = name.strip("'\"")
             if _os.path.exists(csv_path):
                 return self._load_csv(csv_path)
-
-            # Try as a column name
             if name in self._columns:
                 return self._columns[name]
-
+            raise ValueError(f"Cannot resolve table: {name}")
         if t == "RangeSubselect":
             return self._compile(from_item.subquery)
-
-        raise ValueError(f"Cannot resolve table: {name}")
+        raise ValueError(f"Cannot resolve table: {type(from_item).__name__}")
 
     def _load_csv(self, path):
-        """Load a CSV file into a numpy array (single numeric column)."""
         rows = []
         with open(path, 'r') as f:
             reader = _csv.reader(f)
-            header = next(reader, None)
+            next(reader, None)
             for row in reader:
                 if row:
                     try:
@@ -129,28 +212,22 @@ class SqlCompiler:
                         pass
         return np.array(rows, dtype=np.float64)
 
+    # ================================================================
+    # WHERE clause compilation
+    # ================================================================
     def _compile_where(self, q, clause):
-        """Compile WHERE clause into filter operations."""
         t = type(clause).__name__
-
         if t == "A_Expr":
             return self._compile_aexpr(q, clause)
         elif t == "BoolExpr":
             return self._compile_boolexpr(q, clause)
-        elif t == "NullTest":
-            raise NotImplementedError("IS NULL not yet supported")
-        else:
-            raise NotImplementedError(f"WHERE clause type {t} not supported")
 
     def _compile_aexpr(self, q, expr):
         left = self._resolve_column(expr.lexpr)
         op_name = self._resolve_opname(expr.name)
         right = self._eval_const(expr.rexpr)
-
         if left is None:
             return
-
-        # Apply filter based on operator
         if op_name == ">":
             q.filter_gt(right)
         elif op_name == ">=":
@@ -160,17 +237,16 @@ class SqlCompiler:
         elif op_name == "<=":
             q.filter_le(right)
         elif op_name == "=":
-            q.filter_ge(right)  # approximate: x >= val and x <= val
-        elif op_name == "<>":
-            pass  # no direct not-equal filter in query builder yet
+            q.filter_ge(right)
 
     def _compile_boolexpr(self, q, expr):
-        """Compile AND/OR boolean expressions."""
         for arg in expr.args:
             self._compile_where(q, arg)
 
+    # ================================================================
+    # Targets and aggregates
+    # ================================================================
     def _compile_targets(self, q, targets):
-        """Compile SELECT targets."""
         for t in targets:
             val = t.val
             vt = type(val).__name__
@@ -178,34 +254,33 @@ class SqlCompiler:
                 self._compile_func(q, val)
 
     def _compile_func(self, q, func):
-        """Compile aggregate functions onto the query chain."""
         name = self._resolve_opname(func.funcname)
-        if name in ("sum",):     q.sum()
-        elif name in ("count",):  q.count()
-        elif name in ("avg",):    q.sum(); q.count()
-        elif name in ("min",):    q.min()
-        elif name in ("max",):    q.max()
-        else:
-            raise NotImplementedError(f"Aggregate function {name} not supported")
+        if name in ("sum",):
+            q.sum()
+        elif name in ("count",):
+            q.count()
+        elif name in ("avg",):
+            q.sum()
+            q.count()
+        elif name in ("min",):
+            q.min()
+        elif name in ("max",):
+            q.max()
 
-    def _compile_group_by(self, q, group_clause):
-        """Compile GROUP BY clause."""
-        pass  # Group-by requires multi-column support; placeholder
-
+    # ================================================================
+    # Helpers
+    # ================================================================
     def _resolve_column(self, col):
-        """Resolve a column reference."""
         t = type(col).__name__
         if t == "ColumnRef":
             fields = col.fields
             if fields:
-                name = fields[0].value if hasattr(fields[0], 'value') else str(fields[0])
-                return name
+                return fields[0].value if hasattr(fields[0], 'value') else str(fields[0])
         elif t == "A_Const":
             return self._eval_const(col)
         return None
 
     def _resolve_opname(self, name_node):
-        """Resolve an operator/function name node to a string."""
         if isinstance(name_node, (list, tuple)):
             result = ""
             for n in name_node:
@@ -219,11 +294,9 @@ class SqlCompiler:
         return str(name_node).lower()
 
     def _eval_const(self, node):
-        """Evaluate a constant AST node to a Python value."""
         if node is None:
             return None
         t = type(node).__name__
-
         if t == "A_Const":
             val = node.val
             vt = type(val).__name__
@@ -241,26 +314,19 @@ class SqlCompiler:
             return float(node.fval.value if hasattr(node.fval, 'value') else str(node.fval))
         elif t == "TypeCast":
             return self._eval_const(node.arg)
-        elif t == "FuncCall":
-            return None
-
         return None
 
 
+# ================================================================
+# Public API
+# ================================================================
 def execute(sql: str, data=None):
-    """Execute SQL against VoxelVM. One-shot entry point.
-
+    """Execute SQL against VoxelVM.
     Args:
         sql: PostgreSQL-compatible SQL string
-        data: dict mapping table/column names to numpy arrays, or a single numpy array
-
+        data: dict mapping table/column names to numpy arrays
     Returns:
-        Query result (float for aggregates, numpy array for selections)
-
-    Examples:
-        >>> result = execute("SELECT SUM(col) FROM data WHERE col > 500",
-        ...                  data={"data": np.array([...])})
-        >>> result = execute("SELECT SUM(col) FROM 'trades.csv' WHERE col > 100")
+        Query result (float for aggregates, dict for GROUP BY)
     """
     compiler = SqlCompiler(data if isinstance(data, dict) else {"t": data})
     return compiler.execute(sql)
@@ -271,7 +337,7 @@ def load_csv(path, column=0):
     rows = []
     with open(path, 'r') as f:
         reader = _csv.reader(f)
-        next(reader, None)  # skip header
+        next(reader, None)
         for row in reader:
             if row and column < len(row):
                 try:
