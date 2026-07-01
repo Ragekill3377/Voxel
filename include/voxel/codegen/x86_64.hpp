@@ -1618,8 +1618,6 @@ public:
                         a.Vbroadcastsd(4, static_cast<u8>(Reg64::RAX));
                         a.Vxorpd(5, 4, 4);
                         a.Vxorpd(6, 4, 4);
-                        a.Vxorpd(7, 4, 4);
-                        a.Vxorpd(8, 4, 4);
 
                         // Pre-load offset into R8 as byte offset, pre-compute iteration count into R9
                         u8 hOff = alloc.gprForReg[offReg];
@@ -1643,13 +1641,13 @@ public:
                             a.MovRegMem(static_cast<u8>(Reg64::RCX), static_cast<u8>(Reg64::R14), r2off);
                         }
                         a.SubRegReg(static_cast<u8>(Reg64::RCX), static_cast<u8>(Reg64::RAX));
-                        a.AddRegImm(static_cast<u8>(Reg64::RCX), 15);
-                        a.SHRRegImm(static_cast<u8>(Reg64::RCX), 4);  // rcx = iterations
+                        a.AddRegImm(static_cast<u8>(Reg64::RCX), 7);
+                        a.SHRRegImm(static_cast<u8>(Reg64::RCX), 3);  // rcx = iterations
 
                         bcToCode2[b.start] = a.CurrentOffset;
 
-                        // Stage 3+: SIB addressing, countdown loop, 4-way unrolled
-                        // Loop: 16 elements/iter, 4 accumulators ymm5+ymm6+ymm7+ymm8
+                        // Stage 1+2+3: SIB addressing, countdown loop, 2-way unrolled
+                        // Loop: 8 elements/iter, dual accumulators ymm5+ymm6
                         a.VmovupdYmmMemSib(0, static_cast<u8>(Reg64::R15),
                                             static_cast<u8>(Reg64::R8), 3);
                         a.Vcmppd(2, 0, 4, 14);
@@ -1662,27 +1660,13 @@ public:
                         a.Vpand(1, 1, 2);
                         a.Vaddpd(6, 6, 1);
 
-                        a.VmovupdYmmMemSibDisp(9, static_cast<u8>(Reg64::R15),
-                                                static_cast<u8>(Reg64::R8), 3, 64);
-                        a.Vcmppd(10, 9, 4, 14);
-                        a.Vpand(9, 9, 10);
-                        a.Vaddpd(7, 7, 9);
-
-                        a.VmovupdYmmMemSibDisp(11, static_cast<u8>(Reg64::R15),
-                                                 static_cast<u8>(Reg64::R8), 3, 96);
-                        a.Vcmppd(12, 11, 4, 14);
-                        a.Vpand(11, 11, 12);
-                        a.Vaddpd(8, 8, 11);
-
-                        a.AddRegImm(static_cast<u8>(Reg64::R8), 128);
+                        a.AddRegImm(static_cast<u8>(Reg64::R8), 64);
                         a.SubRegImm(static_cast<u8>(Reg64::RCX), 1);
                         a.JnzRel32(0);
                         patches.push_back(BranchPatch{a.CurrentOffset - 4, b.start});
 
-                        // Post-loop: combine 4 accumulators, horizontal reduce, flush liveOut
+                        // Post-loop: combine accumulators, horizontal reduce, flush liveOut
                         a.Vaddpd(5, 5, 6);
-                        a.Vaddpd(7, 7, 8);
-                        a.Vaddpd(5, 5, 7);
                         for (int r = 0; r < 16; ++r) {
                             if (b.liveOut.test(r)) {
                                 u8 h = alloc.gprForReg[r];
