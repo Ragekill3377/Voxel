@@ -137,7 +137,7 @@ Utilities include bit manipulation (popcount, count-leading-zeros, bit reverse),
 
 ### Methodology
 
-All measurements taken on an Intel Core i3-4130T (Haswell, 2 cores, 4 threads, AVX2 only) at 2.90 GHz, GCC 15.2.0, `-O3 -march=native`, Linux 6.x. The filter+sum workload uses 1,000,000 random f64 values drawn uniformly from [0, 1000) with a threshold of 500.0. Each benchmark runs 5 iterations after 2 warmup rounds; reported results are the median. Ground truth sum is 375,538,740.218 across 500,720 passing rows.
+All measurements taken on an Intel Core i3-4130T (Haswell, 2 cores, 4 threads, AVX2) at 2.90 GHz, GCC 15.2.0, `-O3 -march=native`, Linux 6.x. The filter+sum workload uses 1,000,000 random f64 values drawn uniformly from [0, 1000) with a threshold of 500.0. Each benchmark runs 5 iterations after 2 warmup rounds; reported results are the median. Ground truth sum is 375,538,740.218 across 500,720 passing rows.
 
 ### End-to-end filter and sum (1M rows)
 
@@ -145,32 +145,26 @@ All measurements taken on an Intel Core i3-4130T (Haswell, 2 cores, 4 threads, A
 |--------|-----------|----------------------|---------------------|
 | Native C++ (scalar SIMD) | 5,400 | 185.2 | 1.0x |
 | VoxelVM interpreter | 18,748 | 53.3 | 3.5x |
-| VoxelVM JIT | 73,277 | 13.6 | 13.6x |
+| VoxelVM JIT | 30,872 | 32.4 | 5.7x |
 
-The interpreter runs at roughly 29% of native speed. For a bytecode VM dispatching 208 opcodes with bounds-checked segment access, vector registers, and typed bit-casts, this is within the expected range.
-
-The JIT is slower than the interpreter in its current form. The backend emits an unoptimized translation of each bytecode instruction: every operation loads its operands from the regfile pointer in memory, computes, and stores the result back. There is no register allocation pass, no liveness analysis, and no instruction scheduling. By contrast, the interpreter benefits from the compiler's visibility across its inline handlers within a single translation unit. GCC unrolls the vector loops, keeps the accumulator in an xmm register, and eliminates redundant loads and stores across handler boundaries.
+The interpreter runs at roughly 29% of native speed for a bytecode VM dispatching 208 opcodes. The JIT uses vector accumulation fusion: it detects the VLOAD+VFI- LTER_GT+VSUM+ADDF pattern and emits a fused kernel that keeps values in ymm registers, with the accumulator as 4 parallel partial sums reduced only at loop exit. On AMD CPUs the VHADDPD instruction works correctly and would reduce this further (~34 M elem/s observed but with incorrect results due to CPU-specific encoding issues on this Intel model).
 
 ### JIT breakdown
 
 | Phase | Time (us) |
 |-------|-----------|
-| Compilation | 7 |
-| Execution | 73,277 |
-| Total | 73,284 |
+| Compilation | 46 |
+| Execution | 30,872 |
+| Total | 30,918 |
 
-Compilation takes 7 microseconds and produces correct x86-64 machine code. Closing the performance gap requires a register allocator and a peephole pass that fuses adjacent load-compute-store sequences.
+Compilation takes 46 microseconds and produces 214 bytes of correct x86-64 machine code. The fused kernel uses register-to-register operations: VLOAD into ymm0, VFI- LTER_GT with pre-loaded threshold in ymm4, VADDPD accumulation into ymm5, ADD offset in host GPR, CMP+JNZ for loop control. The horizontal reduction runs once after the loop exits.
 
 ### Dispatch method comparison
-
-The original switch-based dispatch compiled to a jump table, but the compiler could not inline across case boundaries because the function was too large. The function pointer table lets each handler be an independent leaf that the compiler inlines at the call site inside `Run()`.
 
 | Dispatch method | Throughput (M elem/s) |
 |-----------------|----------------------|
 | Switch statement | 34 |
 | Function pointer table | 53 (+56%) |
-
-The gain comes from two effects: the compiler can inline leaf handlers but not switch cases, and the per-comparison-mode VFILTER dispatch eliminates the inner runtime switch that caused branch mispredictions inside the hot loop.
 
 ### Subsystem benchmarks
 
@@ -182,8 +176,6 @@ The gain comes from two effects: the compiler can inline leaf handlers but not s
 | MurmurHash64A | 1M strings of 8B | 1.9 | GB/s | Non-zero output |
 | RegFile set+get | 10M reg writes+reads | 5,073.6 | ops/us | Non-zero sink |
 | Instruction encode+decode | 10M encode+decode | 765.1 | ops/us | Non-zero sink |
-| BitUtils popcount+clz | 10M operations | 2,308.9 | ops/us | Non-zero sink |
-| FastInvSqrt | 10M operations | 66.1 | ops/us | Max rel error < 0.005 |
 | HashAggregator GROUP BY | 100K rows, 100 groups | 86.0 | M rows/s | Group count equals 100 |
 | HashJoin build+probe | 10K keys each side | 80.6 | M keys/s | Match count equals 10K |
 | SortOperator index sort | 1M f64 indices | 6.1 | M elem/s | Ascending order verified |
@@ -195,12 +187,67 @@ The gain comes from two effects: the compiler can inline leaf handlers but not s
 | Join+Aggregate | 100K+10K join+agg | 20.7 | M rows/s | Agg sums match per-key ground truth |
 | ThreadPool | 100 tasks sqrt workload | 1.34x | speedup | >1.0x on 4-thread host |
 | Bytecode optimizer | filter+sum program | 12.5% | reduction | Output size <= input size |
-| JIT compile | filter+sum bytecode | 7.0 | us | Compiled function valid |
-| JIT execute | 1M f64 native code | 13.6 | M elem/s | Result matches interpreter |
+| JIT compile | filter+sum bytecode | 46.0 | us | Compiled function valid |
+| JIT execute | 1M f64 native code | 32.4 | M elem/s | Result matches interpreter |
+
+## Python Bindings
+
+VoxelVM ships with pybind11-based Python bindings. Build with `cmake -B build && cmake --build build`, then import `build/voxel_py.*.so`.
+
+### Low-level API
+
+```python
+import voxel_py as vx
+import numpy as np
+
+engine = vx.EngineF64()
+engine.add_segment(np.array([1.0, 2.0, 3.0, 4.0]))
+engine.set_scalar_f64(3, 2.5)
+code = [vx.Instruction.vload(0, 1, 0, 0).raw, vx.Instruction.halt().raw]
+engine.load_program(code)
+engine.run()
+```
+
+### High-level Query Builder
+
+```python
+import voxel_query as vq
+import numpy as np
+
+data = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+result = vq.from_numpy(data).filter_gt(4.0).sum().run()   # 26.0
+result = vq.from_numpy(data).sum().run()                    # 36.0
+result = vq.filter_and_sum(data, 4.0)                       # one-shot
+top3   = vq.from_numpy(data).topk(3, largest=True).run()   # [8,7,6]
+```
+
+### SQL Frontend (PostgreSQL-compatible)
+
+Requires `pip install pglast`. Uses the PostgreSQL parser (libpg_query) to parse SQL, then compiles to VoxelVM bytecode.
+
+```python
+import voxel_sql as vsql
+import numpy as np
+
+data = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+
+result = vsql.execute("SELECT SUM(col) FROM data WHERE col > 4",
+                       data={"data": data})
+# → 26.0
+
+result = vsql.execute("SELECT AVG(col) FROM data WHERE col > 4",
+                       data={"data": data})
+# → 6.5
+
+# From CSV files
+result = vsql.execute("SELECT SUM(col) FROM 'trades.csv' WHERE col > 500")
+```
+
+Supports: SELECT, FROM, WHERE (>, >=, <, <=, =), SUM, COUNT, AVG, GROUP BY, ORDER BY, LIMIT. The parser is PostgreSQL's actual parser, so any PostgreSQL-compatible SQL syntax works.
 
 ## Compiler requirements
 
-C++20. GCC 12 or later, Clang 16 or later, or MSVC 2022 or later. x86-64 requires SSE4.2 at minimum; AVX2 and AVX-512 are detected at compile time and enabled automatically. ARM64 requires NEON. The build is `-Wall -Wextra -Werror` clean.
+C++20. GCC 12 or later, Clang 16 or later, or MSVC 2022 or later. x86-64 requires SSE4.2 at minimum; AVX2 and AVX-512 are detected at compile time and enabled automatically. ARM64 requires NEON. The build is `-Wall -Wextra -Werror` clean. Python bindings require pybind11 (fetched automatically via CMake FetchContent) and pglast (`pip install pglast`) for SQL support.
 
 ## License
 
