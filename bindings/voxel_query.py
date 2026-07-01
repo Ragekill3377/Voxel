@@ -93,13 +93,14 @@ class Query:
         self._emit(_vx.Instruction.add(self._offset_reg, self._offset_reg, lanes))
         self._emit(_vx.Instruction.cmp(self._offset_reg, self._total_reg))
         self._emit(_vx.Instruction.jnz(-6))
+        self._result_is_int = True
         return self
 
     def min(self):
         lanes = self._engine.k_lanes
         r5 = self._alloc_reg()
         vr = self._emit_loop_body()
-        self._emit(_vx.Instruction.vmin(r5, vr))
+        self._emit(_vx.Instruction.vred_min(r5, vr))
         self._emit(_vx.Instruction.cmp(self._acc_reg, r5))
         self._emit(_vx.Instruction.jle(2))
         self._emit(_vx.Instruction.movr(self._acc_reg, r5))
@@ -112,7 +113,7 @@ class Query:
         lanes = self._engine.k_lanes
         r5 = self._alloc_reg()
         vr = self._emit_loop_body()
-        self._emit(_vx.Instruction.vmax(r5, vr))
+        self._emit(_vx.Instruction.vred_max(r5, vr))
         self._emit(_vx.Instruction.cmp(self._acc_reg, r5))
         self._emit(_vx.Instruction.jge(2))
         self._emit(_vx.Instruction.movr(self._acc_reg, r5))
@@ -146,6 +147,8 @@ class Query:
         self._engine.set_scalar(self._offset_reg, 0)
         self._engine.set_scalar(self._total_reg, self._total_count)
 
+        self._result_is_int = False
+
         # Emit lane constant at the START of the program
         self._code.insert(0, _vx.Instruction.mov(self._lane_reg, lanes).raw)
 
@@ -173,6 +176,8 @@ class Query:
         if hasattr(self, '_topk'):
             return _vx.topk_select(self._data, self._topk, self._topk_largest)
 
+        if getattr(self, '_result_is_int', False):
+            return self._engine.get_scalar(self._acc_reg)
         return self._engine.get_scalar_f64(self._acc_reg)
 
 

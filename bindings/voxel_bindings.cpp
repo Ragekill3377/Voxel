@@ -82,6 +82,8 @@ PYBIND11_MODULE(voxel_py, m) {
         .def_static("vsum", &Instruction::VSum)
         .def_static("vmin", &Instruction::VMin)
         .def_static("vmax", &Instruction::VMax)
+        .def_static("vred_min", &Instruction::VRedMin)
+        .def_static("vred_max", &Instruction::VRedMax)
         .def_static("vcount", &Instruction::VCount)
         .def_static("movr", &Instruction::Movr)
         .def_static("jle", &Instruction::Jle)
