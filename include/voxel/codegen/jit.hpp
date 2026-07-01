@@ -74,9 +74,9 @@ public:
     {
         sz allocSize = (bytes + kExecPageSize - 1) & ~(kExecPageSize - 1);
 #if VOXEL_OS_WINDOWS
-        void* ptr = VirtualAlloc(nullptr, allocSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        void* ptr = VirtualAlloc(nullptr, allocSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-        void* ptr = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+        void* ptr = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (ptr == MAP_FAILED) ptr = nullptr;
 #endif
