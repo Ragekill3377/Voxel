@@ -4,6 +4,15 @@ project(voxel VERSION 1.0.0 LANGUAGES CXX)
 
 option(VOXEL_BUILD_SHARED "Build voxel as a shared library" OFF)
 option(VOXEL_BUILD_EXAMPLES "Build example programs" ON)
+option(VOXEL_BUILD_PYTHON "Build Python bindings" ON)
+
+include(FetchContent)
+FetchContent_Declare(
+    pybind11
+    GIT_REPOSITORY https://github.com/pybind/pybind11.git
+    GIT_TAG v2.11.1
+)
+FetchContent_MakeAvailable(pybind11)
 
 # Header-only library — use an INTERFACE target (no source compilation needed)
 add_library(voxel INTERFACE)
@@ -42,3 +51,12 @@ add_test(NAME voxel-test  COMMAND voxel-test)
 add_test(NAME voxel-jit   COMMAND voxel-jit-test)
 
 install(DIRECTORY include/voxel DESTINATION include)
+
+if(VOXEL_BUILD_PYTHON)
+    pybind11_add_module(voxel_py bindings/voxel_bindings.cpp)
+    target_link_libraries(voxel_py PRIVATE voxel)
+    target_compile_features(voxel_py PRIVATE cxx_std_20)
+    if(NOT MSVC)
+        target_compile_options(voxel_py PRIVATE -Wall -Wextra -O3 -march=native)
+    endif()
+endif()
