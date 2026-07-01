@@ -7,6 +7,8 @@
 #include "voxel/bytecode/opcodes.hpp"
 #include "voxel/bytecode/instruction.hpp"
 #include "voxel/data/segment.hpp"
+#include "voxel/data/nulls.hpp"
+#include "voxel/ops/filter.hpp"
 #include "voxel/util/thread.hpp"
 #include <vector>
 #include <cmath>
@@ -134,6 +136,8 @@ private:
     bool                Running_;
     u32                 CallDepth_;
     sz                  CallStack_[kMaxCallDepth];
+    NullBitmap*         CurrentNulls_  = nullptr;
+    sz                  CurrentSegOff_ = 0;
 
     enum class AggOp {
         Count, Sum, Avg, Min, Max, First, Last,
@@ -893,10 +897,16 @@ private:
         const T* src = e->Regs_.VecLanes<T>(va);
         T thresh = e->ScalarAsT(rb);
         u32 mask = 0;
-        for (sz i = 0; i < e->kLanes; ++i) {
-            bool pass = pred(src[i], thresh);
-            dst[i] = pass ? src[i] : T{};
-            if (pass) mask |= (1u << i);
+
+        if (e->CurrentNulls_ && IsChunkAllNull(e->CurrentNulls_, e->CurrentSegOff_, e->CurrentSegOff_ + e->kLanes)) {
+            for (sz i = 0; i < e->kLanes; ++i)
+                dst[i] = T{};
+        } else {
+            for (sz i = 0; i < e->kLanes; ++i) {
+                bool pass = pred(src[i], thresh);
+                dst[i] = pass ? src[i] : T{};
+                if (pass) mask |= (1u << i);
+            }
         }
         e->Regs_.Mask(imm12 & 0x7) = mask;
         e->PC_++;
@@ -1746,12 +1756,15 @@ private:
         T* dst = e->Regs_.VecLanes<T>(rd);
         if (VOXEL_LIKELY(segId < e->Segments_.size())) {
             Segment<T>& seg = e->Segments_[segId];
+            e->CurrentNulls_  = seg.Nulls;
+            e->CurrentSegOff_ = offset;
             for (sz i = 0; i < e->kLanes; ++i) {
                 sz idx = offset + i;
                 dst[i] = (i < count && idx < seg.Count)
                     ? seg.Data[idx] : T{};
             }
         } else {
+            e->CurrentNulls_ = nullptr;
             for (sz i = 0; i < e->kLanes; ++i) dst[i] = T{};
         }
         e->PC_++;

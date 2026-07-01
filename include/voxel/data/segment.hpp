@@ -15,6 +15,8 @@
 
 namespace voxel {
 
+class NullBitmap;
+
 // ============================================================================
 // Segment — zero-copy typed columnar data segment
 // ============================================================================
@@ -36,6 +38,7 @@ public:
     bool     IsEncoded    = false;
     u8       EncodingType = 0;
     Segment<T>* DecodedView = nullptr;
+    NullBitmap* Nulls     = nullptr;
 
     Segment() = default;
 

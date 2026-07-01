@@ -66,13 +66,25 @@ public:
     Arena(Arena&&)                 = delete;
     Arena& operator=(Arena&&)      = delete;
 
+    // Default alignment of 64 bytes prevents false sharing between
+    // concurrently-accessed allocations and ensures SIMD-aligned loads.
     void* Alloc(sz bytes) {
-        bytes = (bytes + 7) & ~7ull;
+        bytes = (bytes + kAlignment - 1) & ~(kAlignment - 1ull);
         if (ThreadSafe_) {
             std::lock_guard<std::mutex> lock(Mutex_);
             return AllocImpl(bytes);
         }
         return AllocImpl(bytes);
+    }
+
+    void* AllocAligned(sz bytes, sz align) {
+        VOXEL_ASSERT((align & (align - 1)) == 0, "alignment must be power of 2");
+        if (align <= kAlignment) return Alloc(bytes);
+        sz padded = bytes + align;
+        u8* raw = static_cast<u8*>(Alloc(padded));
+        uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
+        uintptr_t aligned = (addr + align - 1) & ~(align - 1);
+        return reinterpret_cast<void*>(aligned);
     }
 
     template<typename T>

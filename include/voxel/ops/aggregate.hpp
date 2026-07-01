@@ -260,6 +260,24 @@ public:
         }
     }
 
+    void FinalizeWithStats(TKey* VOXEL_RESTRICT outKeys,
+                           AggregateState* VOXEL_RESTRICT outStates,
+                           f64* VOXEL_RESTRICT outVariance,
+                           f64* VOXEL_RESTRICT outStdDev,
+                           sz maxGroups) {
+        sz written = 0;
+
+        for (sz slot = 0; slot < TableSize_ && written < maxGroups; ++slot) {
+            if (Entries_[slot].Hash != 0) {
+                outKeys[written]     = Entries_[slot].Key;
+                outStates[written]   = Entries_[slot].State;
+                outVariance[written] = Entries_[slot].State.Variance();
+                outStdDev[written]   = Entries_[slot].State.StdDev();
+                ++written;
+            }
+        }
+    }
+
     sz GroupCount() const { return EntryCount_; }
 
     AggregateState* Lookup(TKey key) const {

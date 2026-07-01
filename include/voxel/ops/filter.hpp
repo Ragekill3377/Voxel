@@ -2,6 +2,7 @@
 
 #include "voxel/core/types.hpp"
 #include "voxel/core/platform.hpp"
+#include "voxel/data/nulls.hpp"
 #include <cstring>
 #include <limits>
 #include <algorithm>
@@ -600,4 +601,15 @@ private:
 };
 
 } // namespace ops
+
+// Bulk null-skip helper: check if entire 64-row chunk is all-null
+inline bool IsChunkAllNull(const voxel::NullBitmap* nulls, sz chunkStart, sz chunkEnd) {
+    if (!nulls) return false;
+    sz startWord = chunkStart >> 6;
+    sz endWord = (chunkEnd + 63) >> 6;
+    for (sz w = startWord; w < endWord && w < nulls->WordCount(); ++w)
+        if (nulls->GetWord(w) != 0) return false;
+    return true;
+}
+
 } // namespace voxel

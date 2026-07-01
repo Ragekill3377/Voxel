@@ -488,6 +488,42 @@ int main()
     }
 
     // ================================================================
+    // 30. WorkStealingThreadPool — 100 tasks, measure speedup vs sequential
+    // ================================================================
+    {
+        constexpr sz kTasks = 100;
+        constexpr sz kWorkPerTask = 5000;
+        auto work = []() {
+            volatile f64 v = 1.0;
+            for (sz i = 0; i < kWorkPerTask; ++i) v = std::sqrt(v + 1.0);
+            (void)v;
+        };
+
+        f64 seqUs = 0;
+        {
+            auto t0 = Clock::now();
+            for (sz i = 0; i < kTasks; ++i) work();
+            auto t1 = Clock::now();
+            seqUs = static_cast<f64>(
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+        }
+
+        f64 parUs = MeasureMedian([&]() {
+            WorkStealingThreadPool pool;
+            for (sz i = 0; i < kTasks; ++i) pool.Enqueue(work);
+            pool.WaitAll();
+        });
+
+        f64 speedup = seqUs / parUs;
+        u32 hwThreads = std::thread::hardware_concurrency();
+        results.push_back(MakeResult(
+            "WorkStealingThreadPool speedup", parUs, speedup, "x speedup", (speedup > 1.0),
+            "100 tasks of sqrt workload via work-stealing, sequential=" + std::to_string(static_cast<i64>(seqUs)) +
+            "us, parallel=" + std::to_string(static_cast<i64>(parUs)) +
+            "us, " + std::to_string(hwThreads) + " HW threads"));
+    }
+
+    // ================================================================
     // 17. MurmurHash64A — 1M strings of length 8
     // ================================================================
     {
