@@ -81,7 +81,11 @@ PYBIND11_MODULE(voxel_py, m) {
         .def_static("vfilter_ge", &Instruction::VFilterGe)
         .def_static("vsum", &Instruction::VSum)
         .def_static("vmin", &Instruction::VMin)
-        .def_static("vmax", &Instruction::VMax);
+        .def_static("vmax", &Instruction::VMax)
+        .def_static("vcount", &Instruction::VCount)
+        .def_static("movr", &Instruction::Movr)
+        .def_static("jle", &Instruction::Jle)
+        .def_static("jge", &Instruction::Jge);
 
     // ---- Segment (f64) ----
     py::class_<Segment<f64>>(m, "SegmentF64")
