@@ -487,6 +487,20 @@ private:
     }
 };
 
+template<typename T>
+void TopKSelect(const T* data, sz count, sz k, T* out, bool largest = true) {
+    if (k >= count) { std::copy(data, data + count, out); return; }
+    std::vector<T> copy(data, data + count);
+    if (largest) {
+        std::nth_element(copy.begin(), copy.begin() + k - 1, copy.end(), std::greater<T>());
+        std::sort(copy.begin(), copy.begin() + k, std::greater<T>());
+    } else {
+        std::nth_element(copy.begin(), copy.begin() + k - 1, copy.end());
+        std::sort(copy.begin(), copy.begin() + k);
+    }
+    std::copy(copy.begin(), copy.begin() + k, out);
+}
+
 class SortOperator {
 public:
     static void SortAscending(const Segment<f64>& seg, u32* VOXEL_RESTRICT indexOut) {
@@ -523,6 +537,44 @@ public:
             temp.resize(count);
             std::memcpy(temp.data(), data, count * sizeof(f64));
             sorter.SortDescending(temp.data(), indexOut, count);
+        }
+    }
+
+    static void SortTopK(const Segment<f64>& seg, u32* VOXEL_RESTRICT indexOut, sz k, bool largest) {
+        sz count = seg.Count;
+        const f64* VOXEL_RESTRICT data = seg.Data;
+        if (k == 0 || count == 0) return;
+        k = std::min(k, count);
+
+        std::vector<f64> topk(k);
+        TopKSelect(data, count, k, topk.data(), largest);
+
+        for (sz i = 0; i < count; ++i) {
+            indexOut[i] = static_cast<u32>(i);
+        }
+
+        u32* idxEnd = indexOut + count;
+
+        for (sz i = 0; i < k; ++i) {
+            f64 target = topk[i];
+            for (u32* p = indexOut + i; p < idxEnd; ++p) {
+                if (data[*p] == target) {
+                    if (p != indexOut + i) {
+                        u32 tmp = indexOut[i];
+                        indexOut[i] = *p;
+                        *p = tmp;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if (largest) {
+            std::sort(indexOut, indexOut + k,
+                [data](u32 a, u32 b) { return data[a] > data[b]; });
+        } else {
+            std::sort(indexOut, indexOut + k,
+                [data](u32 a, u32 b) { return data[a] < data[b]; });
         }
     }
 };

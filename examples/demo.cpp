@@ -779,6 +779,137 @@ int main()
             }
         }
     }
+
+    // 27. Zonemap Filter Skip — 10 segments × 100K f64, compute zonemap, count skippable
+    {
+        constexpr sz kSegCount = 10;
+        constexpr sz kSegSize  = 100'000;
+        constexpr sz kTotal    = kSegCount * kSegSize;
+        std::vector<f64> zmData(kTotal);
+        {
+            std::mt19937_64 zmRng(42);
+            std::uniform_real_distribution<f64> zmDist(0.0, 1000.0);
+            for (sz i = 0; i < kTotal; ++i) zmData[i] = zmDist(zmRng);
+        }
+        f64 threshold = 500.0;
+
+        sz skippable = 0;
+        sz skippedElems = 0;
+        f64 scannedSum = 0;
+        sz  scannedCnt = 0;
+        f64 fullSum = 0;
+        sz  fullCnt = 0;
+        f64 us = MeasureMedian([&]() {
+            skippable = 0;
+            skippedElems = 0;
+            scannedSum = 0;
+            scannedCnt = 0;
+            for (sz s = 0; s < kSegCount; ++s) {
+                Segment<f64>::ZoneMap zm;
+                zm.Compute(&zmData[s * kSegSize], kSegSize);
+                if (zm.CanSkipGreaterThan(threshold)) {
+                    skippable++;
+                    skippedElems += kSegSize;
+                } else {
+                    for (sz j = 0; j < kSegSize; ++j) {
+                        f64 v = zmData[s * kSegSize + j];
+                        if (v > threshold) {
+                            scannedSum += v;
+                            scannedCnt++;
+                        }
+                    }
+                }
+            }
+        });
+
+        for (sz i = 0; i < kTotal; ++i) {
+            if (zmData[i] > threshold) { fullSum += zmData[i]; fullCnt++; }
+        }
+        bool sumPass = (scannedCnt == fullCnt) &&
+                        std::fabs(scannedSum - fullSum) < std::max(fullSum, 1.0) * 1e-12;
+        sz scannedFromSkipped = 0;
+        for (sz s = 0; s < kSegCount; ++s) {
+            Segment<f64>::ZoneMap zm;
+            zm.Compute(&zmData[s * kSegSize], kSegSize);
+            if (!zm.CanSkipGreaterThan(threshold)) {
+                for (sz j = 0; j < kSegSize; ++j) {
+                    f64 v = zmData[s * kSegSize + j];
+                    if (v > threshold) scannedFromSkipped++;
+                }
+            }
+        }
+        sumPass = sumPass && (scannedCnt == scannedFromSkipped);
+        f64 throughput = static_cast<f64>(kTotal) / us;
+        results.push_back(MakeResult(
+            "Zonemap Filter Skip", us, throughput, "M elem/s", sumPass,
+            "10 segments x100K f64, zonemap skip " + std::to_string(skippable) +
+            "/" + std::to_string(kSegCount) + " segs vs threshold 500.0"));
+    }
+
+    // 28. TopK Select — select top 1000 from 1M random f64
+    {
+        constexpr sz kTopK     = 1000;
+        std::vector<f64> topkData(N);
+        {
+            std::mt19937_64 topkRng(42);
+            std::uniform_real_distribution<f64> topkDist(0.0, 1000.0);
+            for (sz i = 0; i < N; ++i) topkData[i] = topkDist(topkRng);
+        }
+
+        std::vector<f64> topkOut(kTopK);
+        bool topkPass = true;
+        f64 us = MeasureMedian([&]() {
+            ops::TopK topk;
+            topk.SelectTopK(topkData.data(), N, kTopK, topkOut.data());
+        });
+
+        std::vector<f64> nthData = topkData;
+        std::nth_element(nthData.begin(), nthData.begin() + (N - kTopK), nthData.end());
+        f64 cutoff = nthData[N - kTopK];
+
+        sz correctCount = 0;
+        for (sz i = 0; i < kTopK; ++i) {
+            if (topkOut[i] >= cutoff - 1e-12) ++correctCount;
+        }
+        topkPass = (correctCount >= kTopK - 5);
+
+        f64 throughput = static_cast<f64>(N) / us;
+        results.push_back(MakeResult(
+            "TopK Select", us, throughput, "M elem/s", topkPass,
+            "Quickselect top " + std::to_string(kTopK) + " from 1M f64, " +
+            std::to_string(correctCount) + "/" + std::to_string(kTopK) + " correct"));
+    }
+
+    // 29. Constant Folding — MOV R1,40; ADDI R0,R1,25; CMP R0,R2
+    {
+        std::vector<u32> cfCode = {
+            Instruction::Mov(1, 40).raw,
+            Instruction::Addi(0, 1, 25).raw,
+            Instruction::Cmp(0, 2).raw,
+        };
+        sz origSize = cfCode.size();
+        sz optSize = 0;
+        bool folded = false;
+        f64 us = MeasureMedian([&]() {
+            std::vector<u32> work = cfCode;
+            opt::ConstantFolder cf;
+            sz dummyPc = 0;
+            cf.Run(work, dummyPc);
+
+            for (sz i = 0; i < work.size(); ++i) {
+                Opcode op = opt::ExtractOp(work[i]);
+                if (op == Opcode::MOV && opt::ExtractRd(work[i]) == 0 &&
+                    opt::ExtractSimm12(work[i]) == 65) { folded = true; }
+            }
+            optSize = work.size();
+        });
+        f64 reductionPct = (origSize > 0) ? (1.0 - static_cast<f64>(optSize) / static_cast<f64>(origSize)) * 100.0 : 0.0;
+        results.push_back(MakeResult(
+            "Constant Folding", us, reductionPct, "% reduction", folded,
+            "MOV R1,40; ADDI R0,R1,25 -> MOV R0,65, " +
+            std::to_string(origSize) + "->" + std::to_string(optSize) + " instrs"));
+    }
+
     // ================================================================
     std::cout << "\n================================================================================\n";
     std::cout << "  BENCHMARK SUMMARY TABLE\n";

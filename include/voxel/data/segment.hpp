@@ -181,6 +181,36 @@ public:
         return Span(Data + offset, effective);
     }
 
+    struct ZoneMap {
+        T  MinValue{};
+        T  MaxValue{};
+        sz NullCount   = 0;
+        sz RowCount    = 0;
+        bool HasStats  = false;
+
+        bool CanSkipGreaterThan(T threshold) const { return HasStats && MaxValue <= threshold; }
+        bool CanSkipGreaterEqual(T threshold) const { return HasStats && MaxValue < threshold; }
+        bool CanSkipLessThan(T threshold) const { return HasStats && MinValue >= threshold; }
+        bool CanSkipLessEqual(T threshold) const { return HasStats && MinValue > threshold; }
+        bool CanSkipEqual(T value) const { return HasStats && (MinValue > value || MaxValue < value); }
+        bool CanSkipNotEqual(T value) const { (void)value; return false; }
+
+        void Compute(const T* data, sz count) {
+            if (count == 0) { HasStats = false; return; }
+            MinValue = MaxValue = data[0];
+            NullCount = 0; RowCount = count;
+            for (sz i = 1; i < count; ++i) {
+                if (data[i] < MinValue) MinValue = data[i];
+                if (data[i] > MaxValue) MaxValue = data[i];
+            }
+            HasStats = true;
+        }
+    };
+
+    ZoneMap Stats;
+
+    void ComputeStats() { Stats.Compute(Data, Count); }
+
     Segment Slice(sz offset, sz count) const {
         sz effective = (offset + count <= Count) ? count : (Count > offset ? Count - offset : 0);
         Segment result(Data + offset, effective);

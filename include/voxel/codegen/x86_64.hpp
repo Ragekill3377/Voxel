@@ -855,15 +855,22 @@ public:
 
     void Vextractf128(u8 xdst, u8 ysrc, u8 imm8)
     {
-        EmitVEX3(1, 1, 0, (xdst < 8), true, (xdst < 8), 0x03, false);
+        // VEX.256.66.0F3A.W0 19 /r ib
+        // ModRM.reg = ysrc (source ymm, read), ModRM.rm = xdst (dest xmm/m128, written)
+        // R-ext tracks the reg operand (ysrc); B-ext tracks the rm operand (xdst).
+        EmitVEX3(1, 1, 0, (ysrc < 8), true, (xdst < 8), 0x03, false);
         EmitByte(0x19);
-        EmitModRM(3, 0, xdst & 7);
+        EmitModRM(3, ysrc & 7, xdst & 7);
         EmitByte(imm8);
     }
 
     void Vmovhlps(u8 dst, u8 a, u8 b)
     {
-        EmitByte(0x0F);
+        // VEX.NDS.128.0F.WIG 12 /r
+        // ModRM.reg = dst, vvvv = a (src1), ModRM.rm = b (src2)
+        // No mandatory prefix (pp=0), 128-bit (l=0), map 0F (mmmmm=0x01), W ignored.
+        // R-ext tracks the reg operand (dst); B-ext tracks the rm operand (b).
+        EmitVEX3(0, 0, a, (dst < 8), true, (b < 8), 0x01, false);
         EmitByte(0x12);
         EmitModRM(3, dst & 7, b & 7);
     }
@@ -884,6 +891,19 @@ public:
     // AVX gather
     // ----------------------------------------------------------------
 
+    // KNOWN-BROKEN: Vgatherdpd has three confirmed VSIB encoding bugs and a
+    // signature that cannot express a correct gather. Verified against llvm-mc
+    // ground truth (vgatherdpd ymm0,[rax+xmm1*8],ymm2 = c4 e2 ed 92 04 c8):
+    //   1. ModRM.reg uses indexYmm; must be dst.
+    //   2. VEX.R tracks (indexYmm<8); must track (dst<8) since R extends ModRM.reg.
+    //   3. VEX.X hardcoded true; must track (indexYmm<8) to extend the SIB vector index.
+    //   4. vvvv carries dst; gather's middle operand is the write-mask (~mask).
+    // A correct fix requires a new signature with a mask parameter:
+    //   Vgatherdpd(u8 dst, u8 base, u8 indexYmm, u8 scale, u8 mask)
+    // Deferred: zero call sites in the current emission loop (hot kernel uses
+    // contiguous vmovupd, not gather). Revisit if a kernel needs gather, and
+    // verify with the 32-case VSIB matrix (dst x index x base x mask x scale)
+    // byte-exact against llvm-mc before use.
     void Vgatherdpd(u8 dst, u8 base, u8 indexYmm, u8 scale)
     {
         EmitVEX3(1, 1, dst, (indexYmm < 8), true, (base < 8), 0x02);
