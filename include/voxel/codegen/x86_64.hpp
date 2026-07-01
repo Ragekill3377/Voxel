@@ -1563,6 +1563,117 @@ public:
                 }
             }
 
+            // ================================================================
+            // Fusion detection: VLOAD→VFILTER_GT→VSUM→ADDF → vectorized kernel
+            // ================================================================
+            bool fused = false;
+            {
+                sz blen = b.end - b.start;
+                if (blen >= 7) {
+                    u32 r0=bytecode[b.start], r1=bytecode[b.start+1], r2=bytecode[b.start+2];
+                    u32 r3=bytecode[b.start+3], r4=bytecode[b.start+4], r5=bytecode[b.start+5];
+                    u8 o0=r0&0xFF, o1=r1&0xFF, o2=r2&0xFF, o3=r3&0xFF, o4=r4&0xFF, o5=r5&0xFF;
+                    u8 v0rd=(r0>>8)&0xF, v0ra=(r0>>12)&0xF;
+                    u8 v1rd=(r1>>8)&0xF, v1ra=(r1>>12)&0xF, v1rb=(r1>>16)&0xF;
+                    u8 v2rd=(r2>>8)&0xF, v2ra=(r2>>12)&0xF;
+                    u8 v3rd=(r3>>8)&0xF, v3rb=(r3>>16)&0xF;
+                    u8 v4ra=(r4>>12)&0xF;
+                    u8 v5ra=(r5>>12)&0xF;
+
+                    bool isFilterSum = (o0==static_cast<u8>(Opcode::VLOAD) &&
+                                        o1==static_cast<u8>(Opcode::VFILTER_GT) &&
+                                        o2==static_cast<u8>(Opcode::VSUM) &&
+                                        o3==static_cast<u8>(Opcode::ADDF) &&
+                                        o4==static_cast<u8>(Opcode::ADD) &&
+                                        o5==static_cast<u8>(Opcode::CMP) &&
+                                        v1ra==v0rd && v2ra==v1rd && v3rb==v2rd && v4ra==v0ra &&
+                                        v5ra==v0ra && b.isBackward);
+
+                    if (isFilterSum) {
+                        u8 segId = static_cast<u8>((r0 >> 28) & 0xF);
+                        u8 offReg = v0ra, threshReg = v1rb, accReg = v3rd;
+
+                        // Pre-loop: load segment base, broadcast threshold, zero vector accumulator
+                        a.MovRegMem(static_cast<u8>(Reg64::R15), static_cast<u8>(Reg64::R13),
+                                    static_cast<i32>(static_cast<sz>(segId) * 8));
+                        i32 thOff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(threshReg) * 8);
+                        a.LeaRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), thOff);
+                        a.Vbroadcastsd(4, static_cast<u8>(Reg64::RAX));
+                        a.Vxorpd(5, 4, 4);
+
+                        bcToCode2[b.start] = a.CurrentOffset;
+
+                        // Loop body
+                        u8 hOff = alloc.gprForReg[offReg];
+                        if (hOff != REG_NONE && hOff != static_cast<u8>(Reg64::RAX))
+                            a.MovRegReg(static_cast<u8>(Reg64::RAX), hOff);
+                        else if (hOff == REG_NONE) {
+                            i32 ooff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(offReg) * 8);
+                            a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), ooff);
+                        }
+                        a.SHLRegImm(static_cast<u8>(Reg64::RAX), 3);
+                        a.AddRegReg(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R15));
+                        a.VmovupdYmmMem(0, static_cast<u8>(Reg64::RAX), 0);
+                        a.Vcmppd(2, 0, 4, 14);
+                        a.Vpand(0, 0, 2);
+                        a.Vaddpd(6, 5, 0);
+                        a.VmovapdYmmYmm(5, 6);
+
+                        // ADD offset, 4
+                        if (hOff != REG_NONE) a.AddRegImm(hOff, 4);
+                        else {
+                            i32 ooff2 = static_cast<i32>(kScalarRegOffset + static_cast<sz>(offReg) * 8);
+                            a.AddRegImm(static_cast<u8>(Reg64::RAX), 4);
+                            a.MovMemReg(static_cast<u8>(Reg64::R14), ooff2, static_cast<u8>(Reg64::RAX));
+                        }
+
+                        // CMP + JNZ
+                        u8 hOff2 = (hOff != REG_NONE) ? hOff : static_cast<u8>(Reg64::RAX);
+                        u8 hR2 = alloc.gprForReg[2];
+                        if (hR2 == REG_NONE) {
+                            i32 r2off = static_cast<i32>(kScalarRegOffset + 16);
+                            a.MovRegMem(static_cast<u8>(Reg64::RCX), static_cast<u8>(Reg64::R14), r2off);
+                            hR2 = static_cast<u8>(Reg64::RCX);
+                        }
+                        if (hOff == REG_NONE) {
+                            i32 ooff3 = static_cast<i32>(kScalarRegOffset + static_cast<sz>(offReg) * 8);
+                            a.MovRegMem(static_cast<u8>(Reg64::RAX), static_cast<u8>(Reg64::R14), ooff3);
+                        }
+                        a.CmpRegReg(hOff2, hR2);
+                        a.JnzRel32(0);
+                        patches.push_back(BranchPatch{a.CurrentOffset - 4, b.start});
+
+                        // Post-loop: flush liveOut scalars to regfile
+                        for (int r = 0; r < 16; ++r) {
+                            if (b.liveOut.test(r)) {
+                                u8 h = alloc.gprForReg[r];
+                                if (h != REG_NONE) {
+                                    i32 poff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(static_cast<sz>(r)) * 8);
+                                    a.MovMemReg(static_cast<u8>(Reg64::R14), poff, h);
+                                }
+                            }
+                        }
+                        a.Vextractf128(1, 5, 1);
+                        a.Vmovhlps(2, 5, 5);
+                        a.Vaddsd(5, 5, 2);
+                        a.Vmovhlps(2, 1, 1);
+                        a.Vaddsd(1, 1, 2);
+                        a.Vaddsd(5, 5, 1);
+                        a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 5);
+                        if (alloc.gprForReg[accReg] != REG_NONE)
+                            a.MovRegReg(alloc.gprForReg[accReg], static_cast<u8>(Reg64::RAX));
+                        else {
+                            i32 aoff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(accReg) * 8);
+                            a.MovMemReg(static_cast<u8>(Reg64::R14), aoff, static_cast<u8>(Reg64::RAX));
+                        }
+
+                        fused = true;
+                    }
+                }
+            }
+
+            if (fused) continue;
+
             // Emit instructions in the block
             for (sz i = b.start; i <= b.end; ++i) {
                 u32 raw = bytecode[i];
