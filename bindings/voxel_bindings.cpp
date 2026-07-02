@@ -52,6 +52,7 @@ PYBIND11_MODULE(voxel_py, m) {
 
     // ---- Filter Comparison Constants ----
     m.attr("CMP_EQ") = kCmpEQ; m.attr("CMP_NE") = kCmpNE;
+    m.attr("CMP_EQ") = kCmpEQ; m.attr("CMP_NE") = kCmpNE;
     m.attr("CMP_LT") = kCmpLT; m.attr("CMP_LE") = kCmpLE;
     m.attr("CMP_GT") = kCmpGT; m.attr("CMP_GE") = kCmpGE;
 

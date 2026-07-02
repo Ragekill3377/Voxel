@@ -164,17 +164,22 @@ size_t voxel_null_valid_count(const void* bm)
 // ================================================================
 // HashAggregator
 // ================================================================
+struct AggWrapper { Arena* arena; ops::HashAggregator<u32, f64>* agg; };
 void* voxel_agg_create(void) {
-    auto* arena = new Arena();
-    return new ops::HashAggregator<u32, f64>(*arena);
+    auto* w = new AggWrapper{new Arena(), nullptr};
+    w->agg = new ops::HashAggregator<u32, f64>(*w->arena);
+    return w;
 }
-void  voxel_agg_destroy(void* a) { delete static_cast<ops::HashAggregator<u32, f64>*>(a); }
+void  voxel_agg_destroy(void* a) {
+    auto* w = static_cast<AggWrapper*>(a);
+    delete w->agg; delete w->arena; delete w;
+}
 void  voxel_agg_init(void* a, size_t groups)
-    { static_cast<ops::HashAggregator<u32, f64>*>(a)->Init(groups); }
+    { static_cast<AggWrapper*>(a)->agg->Init(groups); }
 void  voxel_agg_accumulate(void* a, const uint32_t* keys, const double* values, size_t count)
-    { static_cast<ops::HashAggregator<u32, f64>*>(a)->Accumulate(keys, values, count); }
+    { static_cast<AggWrapper*>(a)->agg->Accumulate(keys, values, count); }
 size_t voxel_agg_group_count(const void* a)
-    { return static_cast<const ops::HashAggregator<u32, f64>*>(a)->GroupCount(); }
+    { return static_cast<const AggWrapper*>(a)->agg->GroupCount(); }
 
 // ================================================================
 // Sort & TopK

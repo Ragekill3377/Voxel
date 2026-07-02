@@ -237,7 +237,7 @@ class SqlCompiler:
         elif op_name == "<=":
             q.filter_le(right)
         elif op_name == "=":
-            q.filter_ge(right)
+            q.filter_eq(right)
 
     def _compile_boolexpr(self, q, expr):
         for arg in expr.args:

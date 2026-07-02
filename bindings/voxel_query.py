@@ -47,6 +47,18 @@ class Query:
         self._filter_cmp = _vx.CMP_GE
         return self
 
+    def filter_eq(self, threshold):
+        self._engine.set_scalar_f64(self._thresh_reg, float(threshold))
+        self._has_filter = True
+        self._filter_cmp = _vx.CMP_EQ
+        return self
+
+    def filter_ne(self, threshold):
+        self._engine.set_scalar_f64(self._thresh_reg, float(threshold))
+        self._has_filter = True
+        self._filter_cmp = _vx.CMP_NE
+        return self
+
     def filter_lt(self, threshold):
         self._engine.set_scalar_f64(self._thresh_reg, float(threshold))
         self._has_filter = True
