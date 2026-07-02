@@ -141,13 +141,44 @@ class MarketData:
         return {"middle": middle, "upper": upper, "lower": lower}
 
     def rsi(self, window=14, data=None):
-        """Relative Strength Index."""
+        """Relative Strength Index — VoxelVM-accelerated via window-streaming ops.
+        
+        Falls back to NumPy for small inputs (< 2*window).
+        """
         d = data if data is not None else self._prices
-        delta = np.diff(d)
-        gain = np.where(delta > 0, delta, 0)
-        loss = np.where(delta < 0, -delta, 0)
-        avg_gain = self.rolling_mean(window, gain)
-        avg_loss = self.rolling_mean(window, loss)
+        if d is None:
+            raise ValueError("prices required")
+        N = len(d)
+        n_out = N - window
+        if n_out < 1:
+            return np.array([])
+
+        # Use NumPy for tiny datasets (the engine overhead isn't worth it)
+        if N < 1000:
+            delta = np.diff(d)
+            gain = np.where(delta > 0, delta, 0)
+            loss = np.where(delta < 0, -delta, 0)
+            avg_gain = np.convolve(gain, np.ones(window)/window, mode='valid')
+            avg_loss = np.convolve(loss, np.ones(window)/window, mode='valid')
+            rs = avg_gain / np.where(avg_loss == 0, 1e-10, avg_loss)
+            return 100.0 - (100.0 / (1.0 + rs))
+
+        e = _vx.EngineF64()
+
+        # Step 1: window_delta — compute price differences
+        deltas = np.zeros(N, dtype=np.float64)
+        e.window_delta(d, deltas)
+
+        # Step 2: separate gains and losses
+        gains = np.where(deltas > 0, deltas, 0.0)
+        losses = np.where(deltas < 0, -deltas, 0.0)
+
+        # Step 3: window_mean on gains and losses (first value = avg of first window)
+        avg_gain = np.zeros(n_out, dtype=np.float64)
+        avg_loss = np.zeros(n_out, dtype=np.float64)
+        e.window_mean(gains, avg_gain, window)
+        e.window_mean(losses, avg_loss, window)
+
         rs = avg_gain / np.where(avg_loss == 0, 1e-10, avg_loss)
         return 100.0 - (100.0 / (1.0 + rs))
 

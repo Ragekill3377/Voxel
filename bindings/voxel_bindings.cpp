@@ -122,7 +122,25 @@ PYBIND11_MODULE(voxel_py, m) {
         .def("set_scalar_f64", [](Engine<f64>& e, sz i, f64 v) {
             e.ScalarReg(i) = std::bit_cast<u64>(v);
         })
-        .def_property_readonly_static("k_lanes", [](py::object) { return Engine<f64>::kLanes; });
+        .def_property_readonly_static("k_lanes", [](py::object) { return Engine<f64>::kLanes; })
+        .def("window_delta", [](Engine<f64>& e, py::array_t<f64> arr, py::array_t<f64> out) {
+            auto src = arr.request(); auto dst = out.request();
+            sz n = e.WindowDelta(static_cast<const f64*>(src.ptr), static_cast<sz>(arr.size()),
+                                  static_cast<f64*>(dst.ptr), static_cast<sz>(out.size()));
+            return n;
+        }, py::arg("data"), py::arg("out"))
+        .def("window_sum", [](Engine<f64>& e, py::array_t<f64> arr, py::array_t<f64> out, u8 window) {
+            auto src = arr.request(); auto dst = out.request();
+            sz n = e.WindowSum(static_cast<const f64*>(src.ptr), static_cast<sz>(arr.size()),
+                                static_cast<f64*>(dst.ptr), static_cast<sz>(out.size()), window);
+            return n;
+        }, py::arg("data"), py::arg("out"), py::arg("window"))
+        .def("window_mean", [](Engine<f64>& e, py::array_t<f64> arr, py::array_t<f64> out, u8 window) {
+            auto src = arr.request(); auto dst = out.request();
+            sz n = e.WindowMean(static_cast<const f64*>(src.ptr), static_cast<sz>(arr.size()),
+                                 static_cast<f64*>(dst.ptr), static_cast<sz>(out.size()), window);
+            return n;
+        }, py::arg("data"), py::arg("out"), py::arg("window"));
 
     // ---- Engine<i64> ----
     py::class_<Engine<i64>>(m, "EngineI64")

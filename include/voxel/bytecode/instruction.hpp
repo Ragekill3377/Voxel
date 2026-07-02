@@ -846,6 +846,23 @@ struct Instruction {
         return Instruction{Encode(Opcode::VNTH, rd, va, 0, n & 0xFFF)};
     }
 
+    // --- Window-Streaming Reduction (0xDD-0xDF) ---
+    // Encodes: [op:8][vd:4][ra:4][rb:4][window:8][segId:4]
+    // WDELTA: rb is the carry scalar register (holds prev value for diff).
+    // WINDOW_SUM/WINDOW_MEAN: imm is the window size (1-255).
+    static Instruction WDelta(u8 vd, u8 ra, u8 segId, u8 carryReg) {
+        return Instruction{Encode(Opcode::WDELTA, vd, ra, carryReg,
+            static_cast<u16>((segId & 0xF) << 8))};
+    }
+    static Instruction WindowSum(u8 vd, u8 ra, u8 segId, u8 window) {
+        return Instruction{Encode(Opcode::WINDOW_SUM, vd, ra, 0,
+            static_cast<u16>((window & 0xFF) | ((segId & 0xF) << 8)))};
+    }
+    static Instruction WindowMean(u8 vd, u8 ra, u8 segId, u8 window) {
+        return Instruction{Encode(Opcode::WINDOW_MEAN, vd, ra, 0,
+            static_cast<u16>((window & 0xFF) | ((segId & 0xF) << 8)))};
+    }
+
     // ====================================================================
     // Aggregate Operators — 0xE0..0xEF
     // ====================================================================

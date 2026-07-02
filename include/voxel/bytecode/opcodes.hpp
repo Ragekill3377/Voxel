@@ -213,6 +213,12 @@ enum class Opcode : u8 {
     VLAST        = 0xDB,
     VNTH         = 0xDC,
 
+    // Window-streaming reduction (0xDD-0xDF) — single-pass over segment,
+    // filling vector registers with windowed results. Caller VSTOREs to output segment.
+    WDELTA       = 0xDD,    // adjacent differences: vd[i]=seg[i]-seg[i-1], carry in rb
+    WINDOW_SUM   = 0xDE,    // sliding window sum, imm12 = window size
+    WINDOW_MEAN  = 0xDF,    // sliding window mean (= WINDOW_SUM / imm12)
+
     // --- Aggregate Operators (0xE0-0xEF) ---
     AGG_COUNT     = 0xE0,
     AGG_SUM       = 0xE1,
@@ -372,6 +378,9 @@ inline constexpr const char* OpcodeName(Opcode op) {
     case Opcode::VANY: return "vany"; case Opcode::VALL: return "vall";
     case Opcode::VFIRST: return "vfirst"; case Opcode::VLAST: return "vlast";
     case Opcode::VNTH: return "vnth";
+    case Opcode::WDELTA: return "wdelta";
+    case Opcode::WINDOW_SUM: return "window_sum";
+    case Opcode::WINDOW_MEAN: return "window_mean";
     case Opcode::AGG_COUNT: return "agg_count"; case Opcode::AGG_SUM: return "agg_sum";
     case Opcode::AGG_AVG: return "agg_avg"; case Opcode::AGG_MIN: return "agg_min";
     case Opcode::AGG_MAX: return "agg_max"; case Opcode::AGG_FIRST: return "agg_first";

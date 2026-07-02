@@ -159,6 +159,54 @@ public:
         SetScalarT(resultReg, combined);
     }
 
+    // ============================================================
+    // WINDOW-STREAMING — single-pass over segment data, filling
+    // output arrays with windowed results. Generic math primitives.
+    // ============================================================
+
+    /// Compute adjacent differences: out[i] = data[i+1] - data[i].
+    /// Returns number of elements written (N-1).
+    static sz WindowDelta(const T* data, sz count, T* out, sz outLen) {
+        if (count < 2) return 0;
+        sz N = std::min<sz>(count - 1, outLen);
+        sz i = 0;
+        for (; i + kLanes <= N; i += kLanes) {
+            for (sz j = 0; j < kLanes; ++j)
+                out[i + j] = data[i + j + 1] - data[i + j];
+        }
+        for (; i < N; ++i) out[i] = data[i + 1] - data[i];
+        return N;
+    }
+
+    /// Sliding window sum: out[j] = sum(data[j .. j+window-1]).
+    static sz WindowSum(const T* data, sz count, T* out, sz outLen, u8 window) {
+        if (window == 0 || count < window) return 0;
+        sz nWindows = count - window + 1;
+        sz N = std::min<sz>(nWindows, outLen);
+        sz j = 0;
+        for (; j + kLanes <= N; j += kLanes) {
+            for (sz d = 0; d < kLanes; ++d) {
+                T sum = T{};
+                for (sz k = 0; k < window; ++k) sum += data[j + d + k];
+                out[j + d] = sum;
+            }
+        }
+        for (; j < N; ++j) {
+            T sum = T{};
+            for (sz k = 0; k < window; ++k) sum += data[j + k];
+            out[j] = sum;
+        }
+        return N;
+    }
+
+    /// Sliding window mean: out[j] = sum(data[j .. j+window-1]) / window.
+    static sz WindowMean(const T* data, sz count, T* out, sz outLen, u8 window) {
+        sz n = WindowSum(data, count, out, outLen, window);
+        T w = static_cast<T>(window);
+        for (sz i = 0; i < n; ++i) out[i] /= w;
+        return n;
+    }
+
 private:
 
     using DispatchFn = void (*)(Engine<T>*, u32 raw);
@@ -2937,6 +2985,70 @@ private:
     }
 
     // ================================================================
+    // DISPATCH HANDLERS — WINDOW-STREAMING REDUCTION (0xDD-0xDF)
+    // ================================================================
+
+    VOXEL_ALWAYS_INLINE
+    static void HandleWDELTA(Engine<T>* e, u32 raw) {
+        u8 vd = Rd(raw); u8 ra = Ra(raw); u8 segId = (Imm12(raw) >> 8) & 0xF;
+        (void)Rb(raw); // carryReg: reserved for cross-chunk carry
+        if (segId >= e->Segments_.size()) { e->PC_++; return; }
+        Segment<T>& seg = e->Segments_[segId];
+        sz offset = static_cast<sz>(e->ScalarAsI64(ra));
+        T* dst = e->Regs_.VecLanes<T>(vd);
+        sz count = e->kLanes;
+        if (offset + count >= seg.Count) count = seg.Count > offset + 1 ? seg.Count - offset - 1 : 0;
+        for (sz i = 0; i < count; ++i) {
+            sz idx = offset + i;
+            dst[i] = seg.Data[idx + 1] - seg.Data[idx];
+        }
+        for (sz i = count; i < e->kLanes; ++i) dst[i] = T{};
+        e->Regs_.Scalar(ra) = static_cast<u64>(offset + count);
+        e->PC_++;
+    }
+
+    VOXEL_ALWAYS_INLINE
+    static void HandleWINDOW_SUM(Engine<T>* e, u32 raw) {
+        u8 vd = Rd(raw); u8 ra = Ra(raw); u16 imm12 = Imm12(raw);
+        u8 window = imm12 & 0xFF; u8 segId = (imm12 >> 8) & 0xF;
+        if (window == 0 || segId >= e->Segments_.size()) { e->PC_++; return; }
+        Segment<T>& seg = e->Segments_[segId];
+        sz offset = static_cast<sz>(e->ScalarAsI64(ra));
+        T* dst = e->Regs_.VecLanes<T>(vd);
+        for (sz j = 0; j < e->kLanes; ++j) {
+            sz start = offset + j;
+            if (start + window > seg.Count) { dst[j] = T{}; continue; }
+            T sum = T{};
+            for (sz k = 0; k < window; ++k) sum += seg.Data[start + k];
+            dst[j] = sum;
+        }
+        sz advanced = std::min<sz>(e->kLanes, seg.Count > offset ? seg.Count - offset : 0);
+        e->Regs_.Scalar(ra) = static_cast<u64>(offset + advanced);
+        e->PC_++;
+    }
+
+    VOXEL_ALWAYS_INLINE
+    static void HandleWINDOW_MEAN(Engine<T>* e, u32 raw) {
+        u8 vd = Rd(raw); u8 ra = Ra(raw); u16 imm12 = Imm12(raw);
+        u8 window = imm12 & 0xFF; u8 segId = (imm12 >> 8) & 0xF;
+        if (window == 0 || segId >= e->Segments_.size()) { e->PC_++; return; }
+        Segment<T>& seg = e->Segments_[segId];
+        sz offset = static_cast<sz>(e->ScalarAsI64(ra));
+        T* dst = e->Regs_.VecLanes<T>(vd);
+        T winv = T(1) / static_cast<T>(window);
+        for (sz j = 0; j < e->kLanes; ++j) {
+            sz start = offset + j;
+            if (start + window > seg.Count) { dst[j] = T{}; continue; }
+            T sum = T{};
+            for (sz k = 0; k < window; ++k) sum += seg.Data[start + k];
+            dst[j] = sum * winv;
+        }
+        sz advanced = std::min<sz>(e->kLanes, seg.Count > offset ? seg.Count - offset : 0);
+        e->Regs_.Scalar(ra) = static_cast<u64>(offset + advanced);
+        e->PC_++;
+    }
+
+    // ================================================================
     // DISPATCH HANDLERS — AGGREGATE (0xE0-0xEF)
     // ================================================================
 
@@ -3150,7 +3262,7 @@ private:
         &HandleVSUM, &HandleVPROD, &HandleVMEAN, &HandleVSTDDEV,
         &HandleVVARIANCE, &HandleVRED_MIN, &HandleVRED_MAX, &HandleVCOUNT,
         &HandleVANY, &HandleVALL, &HandleVFIRST, &HandleVLAST,
-        &HandleVNTH, &HandleINVALID, &HandleINVALID, &HandleINVALID,
+         &HandleVNTH, &HandleWDELTA, &HandleWINDOW_SUM, &HandleWINDOW_MEAN,
         /* 0xE0-0xEF: Aggregate */
         &HandleAGG_COUNT, &HandleAGG_SUM, &HandleAGG_AVG, &HandleAGG_MIN,
         &HandleAGG_MAX, &HandleAGG_FIRST, &HandleAGG_LAST, &HandleAGG_STDDEV,
