@@ -16,15 +16,18 @@ public class VoxelVM {
         //   System.mapLibraryName        (libvoxel_c.so / .dylib / .dll)
         //   default search in ./build/
         String libName = System.getProperty("voxel.lib");
-        if (libName == null) {
+        Path libPath;
+        if (libName != null) {
+            libPath = Path.of(libName);
+        } else {
             libName = System.mapLibraryName("voxel_c");
-        }
-        Path libPath = Path.of("build", libName);
-        if (!libPath.toFile().exists()) {
-            libPath = Path.of(System.getProperty("user.dir"), "build", libName);
-        }
-        if (!libPath.toFile().exists()) {
-            libPath = Path.of(libName); // try bare name (system path)
+            libPath = Path.of("build", libName);
+            if (!libPath.toFile().exists()) {
+                libPath = Path.of(System.getProperty("user.dir"), "build", libName);
+            }
+            if (!libPath.toFile().exists()) {
+                libPath = Path.of(libName);
+            }
         }
         LIB = SymbolLookup.libraryLookup(libPath, Arena.global());
     }
@@ -34,7 +37,7 @@ public class VoxelVM {
     // ================================================================
     public static class Engine implements AutoCloseable {
         private final MemorySegment ptr;
-        private static final MethodHandle create, destroy, addSeg, loadProg, run, setS, getS, setSF, getSF, runPar;
+        private static final MethodHandle create, destroy, addSeg, loadProg, run;
         static {
             create = LINKER.downcallHandle(LIB.find("voxel_engine_create_f64").get(),
                 FunctionDescriptor.of(ValueLayout.ADDRESS));
@@ -62,7 +65,9 @@ public class VoxelVM {
 
         public void run() throws Throwable { run.invokeExact(ptr); }
 
-        @Override public void close() throws Throwable { destroy.invokeExact(ptr); }
+        @Override public void close() throws Exception {
+            try { destroy.invokeExact(ptr); } catch (Throwable t) { throw new Exception(t); }
+        }
     }
 
     // ================================================================
@@ -123,6 +128,8 @@ public class VoxelVM {
         };
     }
 
+    private static int enc(int op, int rd, int ra) { return enc(op, rd, ra, 0, 0); }
+    private static int enc(int op, int rd, int ra, int rb) { return enc(op, rd, ra, rb, 0); }
     private static int enc(int op, int rd, int ra, int rb, int imm) {
         return (op & 0xFF) | ((rd & 0xF) << 8) | ((ra & 0xF) << 12) | ((rb & 0xF) << 16) | ((imm & 0xFFF) << 20);
     }

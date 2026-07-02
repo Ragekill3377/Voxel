@@ -12,9 +12,15 @@ public class VoxelBench {
     public static void main(String[] args) throws Throwable {
         var linker = Linker.nativeLinker();
         String libName = System.getProperty("voxel.lib");
-        if (libName == null) libName = System.mapLibraryName("voxel_c");
-        Path libPath = Path.of("build", libName);
-        if (!libPath.toFile().exists()) libPath = Path.of(System.getProperty("user.dir"), "build", libName);
+        Path libPath;
+        if (libName != null) {
+            libPath = Path.of(libName);
+        } else {
+            libName = System.mapLibraryName("voxel_c");
+            libPath = Path.of("build", libName);
+            if (!libPath.toFile().exists())
+                libPath = Path.of(System.getProperty("user.dir"), "build", libName);
+        }
         System.out.println("Loading: " + libPath.toAbsolutePath());
         var lib = SymbolLookup.libraryLookup(libPath, Arena.global());
         var jitRun = linker.downcallHandle(lib.find("voxel_jit_run").get(),
