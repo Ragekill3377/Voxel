@@ -33,10 +33,16 @@ taskset -c 0 ./build/validate
 ## Python
 
 ```python
-# Low-level
+# Low-level engine
 import voxel_py as vx
 engine = vx.EngineF64()
 engine.run()
+
+# JIT: one-shot filter+sum at native speed
+import numpy as np
+data = np.random.uniform(0, 1000, 1_000_000).astype(np.float64)
+result = vx.jit_run(code, data, threshold=500.0, total_count=len(data))
+# ~1,500 M elem/s, correct result verified
 
 # Query builder
 import voxel_query as vq

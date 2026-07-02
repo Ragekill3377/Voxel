@@ -293,6 +293,32 @@ PYBIND11_MODULE(voxel_py, m) {
         );
     });
 
+    m.def("jit_run", [](std::vector<u32> code, py::array_t<f64> data,
+                        f64 threshold, sz totalCount) -> f64 {
+        auto compiler = codegen::CreateJitCompiler();
+        if (!compiler) throw std::runtime_error("No JIT backend");
+        codegen::JitFunction func;
+        if (!compiler->Compile(code.data(), code.size(), func) || !func.IsValid())
+            throw std::runtime_error("JIT compilation failed");
+
+        auto buf = data.request();
+        RegFile rf;
+        rf.Scalar(0) = 0;
+        rf.Scalar(1) = 0;
+        rf.Scalar(2) = totalCount;
+        rf.Scalar(3) = std::bit_cast<u64>(threshold);
+
+        f64* segBase = static_cast<f64*>(buf.ptr);
+        u64  segCount = buf.size;
+
+        func.Entry(&rf, &segBase, &segCount);
+
+        f64 result = std::bit_cast<f64>(rf.Scalar(0));
+        compiler->Release(func);
+        return result;
+    },
+    py::arg("code"), py::arg("data"), py::arg("threshold"), py::arg("total_count"));
+
     // ---- Version ----
     m.attr("__version__") = "1.0.0";
 
