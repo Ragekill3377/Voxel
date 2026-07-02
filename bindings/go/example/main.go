@@ -2,7 +2,7 @@ package main
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../..
-#cgo LDFLAGS: -L${SRCDIR}/../../build -lvoxel_c -lstdc++ -lm -Wl,-rpath,${SRCDIR}/../../build
+#cgo LDFLAGS: -lvoxel_c -lstdc++ -lm
 */
 import "C"
 

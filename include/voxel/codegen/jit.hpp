@@ -16,6 +16,9 @@
     #include <sys/mman.h>
     #include <unistd.h>
 #endif
+#if VOXEL_OS_MACOS && VOXEL_ARCH_ARM64
+    #include <pthread.h>
+#endif
 
 namespace voxel {
 namespace codegen {
@@ -70,6 +73,14 @@ public:
     JitMemoryManager(const JitMemoryManager&)            = delete;
     JitMemoryManager& operator=(const JitMemoryManager&) = delete;
 
+#if VOXEL_OS_MACOS && VOXEL_ARCH_ARM64
+    static void EnableJitWrite() { pthread_jit_write_protect_cb(0); }
+    static void EnableJitExec()  { pthread_jit_write_protect_cb(1); }
+#else
+    static void EnableJitWrite() {}
+    static void EnableJitExec()  {}
+#endif
+
     void* Allocate(sz bytes)
     {
         sz allocSize = (bytes + kExecPageSize - 1) & ~(kExecPageSize - 1);
@@ -99,6 +110,9 @@ public:
         if (!ptr) return false;
         sz pageSize = kExecPageSize;
         sz alignedSize = (bytes + pageSize - 1) & ~(pageSize - 1);
+#if VOXEL_OS_MACOS && VOXEL_ARCH_ARM64
+        pthread_jit_write_protect_cb(1); // enable execute, disable write
+#endif
 #if VOXEL_OS_WINDOWS
         DWORD oldProt;
         return VirtualProtect(ptr, alignedSize, PAGE_EXECUTE_READ, &oldProt) != 0;
@@ -112,6 +126,9 @@ public:
         if (!ptr) return false;
         sz pageSize = kExecPageSize;
         sz alignedSize = (bytes + pageSize - 1) & ~(pageSize - 1);
+#if VOXEL_OS_MACOS && VOXEL_ARCH_ARM64
+        pthread_jit_write_protect_cb(0); // disable execute, enable write
+#endif
 #if VOXEL_OS_WINDOWS
         DWORD oldProt;
         return VirtualProtect(ptr, alignedSize, PAGE_READWRITE, &oldProt) != 0;

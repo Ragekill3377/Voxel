@@ -5,6 +5,7 @@ package com.voxelvm;
 
 import java.lang.foreign.*;
 import java.lang.invoke.*;
+import java.nio.file.Path;
 
 public class VoxelBench {
     private static final Linker LINKER = Linker.nativeLinker();
@@ -12,9 +13,16 @@ public class VoxelBench {
     private static final MethodHandle jitRun, create, destroy, addSeg, loadProg, run, setS, getSF;
 
     static {
-        var libPath = java.nio.file.Path.of("build/libvoxel_c.so");
+        String libName = System.getProperty("voxel.lib");
+        if (libName == null) {
+            libName = System.mapLibraryName("voxel_c");
+        }
+        var libPath = Path.of("build", libName);
         if (!libPath.toFile().exists()) {
-            libPath = java.nio.file.Path.of("../build/libvoxel_c.so");
+            libPath = Path.of(System.getProperty("user.dir"), "build", libName);
+        }
+        if (!libPath.toFile().exists()) {
+            libPath = Path.of(libName);
         }
         LIB = SymbolLookup.libraryLookup(libPath, Arena.global());
         jitRun = LINKER.downcallHandle(LIB.find("voxel_jit_run").get(),
@@ -76,25 +84,8 @@ public class VoxelBench {
             System.out.printf("Dataset: %d f64, threshold %.0f, expected %.3f\n", N, threshold, expectedSum);
             System.out.flush();
 
-            // Quick test with 8-element array first
-            System.out.println("Quick test..."); System.out.flush();
-            try (var smallArena = Arena.ofConfined()) {
-                var testData = smallArena.allocate(8 * 8);
-                double[] testVals = {1,2,3,4,5,6,7,8};
-                for (int i = 0; i < 8; i++) testData.setAtIndex(ValueLayout.JAVA_DOUBLE, i, testVals[i]);
-                double testResult = (double) jitRun.invoke(codeSeg, (long)codeRaw.length, testData, 8L, 4.0);
-                System.out.printf("  8-element test: %.1f (expected 26.0) %s\n", testResult,
-                    Math.abs(testResult - 26.0) < 1e-6 ? "OK" : "FAIL");
-                System.out.flush();
-            }
-            System.out.println("Quick test done"); System.out.flush();
-
-            // Full benchmark
-            System.out.println("Warmup..."); System.out.flush();
-            jitRun.invoke(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
-            System.out.println("Warmup done"); System.out.flush();
-
             // Warmup
+            jitRun.invoke(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
             jitRun.invoke(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
 
             // Measured

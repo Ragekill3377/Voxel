@@ -11,10 +11,20 @@ public class VoxelVM {
     private static final SymbolLookup LIB;
     
     static {
-        // Load libvoxel_c.so from the build directory or system path
-        Path libPath = Path.of(System.getProperty("user.dir"), "build", "libvoxel_c.so");
+        // Resolve library path cross-platform:
+        //   -Dvoxel.lib=/absolute/path   (explicit override)
+        //   System.mapLibraryName        (libvoxel_c.so / .dylib / .dll)
+        //   default search in ./build/
+        String libName = System.getProperty("voxel.lib");
+        if (libName == null) {
+            libName = System.mapLibraryName("voxel_c");
+        }
+        Path libPath = Path.of("build", libName);
         if (!libPath.toFile().exists()) {
-            libPath = Path.of("build", "libvoxel_c.so");
+            libPath = Path.of(System.getProperty("user.dir"), "build", libName);
+        }
+        if (!libPath.toFile().exists()) {
+            libPath = Path.of(libName); // try bare name (system path)
         }
         LIB = SymbolLookup.libraryLookup(libPath, Arena.global());
     }

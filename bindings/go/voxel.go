@@ -2,7 +2,9 @@ package voxel
 
 /*
 #cgo CFLAGS: -I${SRCDIR}/../..
-#cgo LDFLAGS: -L${SRCDIR}/../../build -lvoxel_c -lstdc++ -lm -Wl,-rpath,${SRCDIR}/../../build
+// Link: user must set CGO_LDFLAGS="-L/path/to/build" or install libvoxel_c to system path
+// The library name is platform-independent (libvoxel_c.so / .dylib / .dll)
+#cgo LDFLAGS: -lvoxel_c -lstdc++ -lm
 #include "bindings/voxel_c.h"
 */
 import "C"
