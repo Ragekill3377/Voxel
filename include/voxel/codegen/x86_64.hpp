@@ -366,7 +366,11 @@ public:
 
     void VmovupdYmmMemSib(u8 ymm, u8 base, u8 index, u8 scale)
     {
-        EmitVEX2(1, 1, 0, (ymm < 8));
+        if (base < 8 && index < 8 && ymm < 8) {
+            EmitVEX2(1, 1, 0, true);
+        } else {
+            EmitVEX3(1, 1, 0, (ymm < 8), (index < 8), (base < 8), 1);
+        }
         EmitByte(0x10);
         EmitModRM(0, ymm & 7, 4);
         EmitSIB(scale & 3, index & 7, base & 7);
@@ -374,7 +378,11 @@ public:
 
     void VmovupdYmmMemSibDisp(u8 ymm, u8 base, u8 index, u8 scale, i8 disp)
     {
-        EmitVEX2(1, 1, 0, (ymm < 8));
+        if (base < 8 && index < 8 && ymm < 8) {
+            EmitVEX2(1, 1, 0, true);
+        } else {
+            EmitVEX3(1, 1, 0, (ymm < 8), (index < 8), (base < 8), 1);
+        }
         EmitByte(0x10);
         EmitModRM(1, ymm & 7, 4);
         EmitSIB(scale & 3, index & 7, base & 7);
@@ -1585,7 +1593,7 @@ public:
             // ================================================================
             bool fused = false;
             {
-                sz blen = b.end - b.start;
+                sz blen = b.end - b.start + 1;
                 if (blen >= 7) {
                     u32 r0=bytecode[b.start], r1=bytecode[b.start+1], r2=bytecode[b.start+2];
                     u32 r3=bytecode[b.start+3], r4=bytecode[b.start+4], r5=bytecode[b.start+5];
@@ -1649,13 +1657,13 @@ public:
                         // Stage 1+2+3: SIB addressing, countdown loop, 2-way unrolled
                         // Loop: 8 elements/iter, dual accumulators ymm5+ymm6
                         a.VmovupdYmmMemSib(0, static_cast<u8>(Reg64::R15),
-                                            static_cast<u8>(Reg64::R8), 3);
+                                            static_cast<u8>(Reg64::R8), 0);
                         a.Vcmppd(2, 0, 4, 14);
                         a.Vpand(0, 0, 2);
                         a.Vaddpd(5, 5, 0);
 
                         a.VmovupdYmmMemSibDisp(1, static_cast<u8>(Reg64::R15),
-                                                static_cast<u8>(Reg64::R8), 3, 32);
+                                                static_cast<u8>(Reg64::R8), 0, 32);
                         a.Vcmppd(2, 1, 4, 14);
                         a.Vpand(1, 1, 2);
                         a.Vaddpd(6, 6, 1);
@@ -1665,17 +1673,8 @@ public:
                         a.JnzRel32(0);
                         patches.push_back(BranchPatch{a.CurrentOffset - 4, b.start});
 
-                        // Post-loop: combine accumulators, horizontal reduce, flush liveOut
+                        // Post-loop: reduce accumulators first, then flush liveOut
                         a.Vaddpd(5, 5, 6);
-                        for (int r = 0; r < 16; ++r) {
-                            if (b.liveOut.test(r)) {
-                                u8 h = alloc.gprForReg[r];
-                                if (h != REG_NONE) {
-                                    i32 poff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(static_cast<sz>(r)) * 8);
-                                    a.MovMemReg(static_cast<u8>(Reg64::R14), poff, h);
-                                }
-                            }
-                        }
                         a.Vextractf128(1, 5, 1);
                         a.Vmovhlps(2, 5, 5);
                         a.Vaddsd(5, 5, 2);
@@ -1683,11 +1682,17 @@ public:
                         a.Vaddsd(1, 1, 2);
                         a.Vaddsd(5, 5, 1);
                         a.MovqRegXmm(static_cast<u8>(Reg64::RAX), 5);
-                        if (alloc.gprForReg[accReg] != REG_NONE)
-                            a.MovRegReg(alloc.gprForReg[accReg], static_cast<u8>(Reg64::RAX));
-                        else {
-                            i32 aoff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(accReg) * 8);
-                            a.MovMemReg(static_cast<u8>(Reg64::R14), aoff, static_cast<u8>(Reg64::RAX));
+                        // Store result to regfile (RBX gets clobbered by epilogue stack restore)
+                        i32 resOff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(accReg) * 8);
+                        a.MovMemReg(static_cast<u8>(Reg64::R14), resOff, static_cast<u8>(Reg64::RAX));
+                        for (int r = 0; r < 16; ++r) {
+                            if (b.liveOut.test(r) && r != accReg) {
+                                u8 h = alloc.gprForReg[r];
+                                if (h != REG_NONE) {
+                                    i32 poff = static_cast<i32>(kScalarRegOffset + static_cast<sz>(static_cast<sz>(r)) * 8);
+                                    a.MovMemReg(static_cast<u8>(Reg64::R14), poff, h);
+                                }
+                            }
                         }
 
                         fused = true;
