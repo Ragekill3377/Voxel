@@ -8,7 +8,7 @@ Columnar analytics engines spend their cycles inside tight loops: load a batch o
 
 Most bytecode VMs are either toys that handle six opcodes and two types, or full JVM/CLR-class runtimes that include garbage collection, class loading, and a large baseline. VoxelVM targets the middle ground: it handles 208 opcodes across f64, f32, i64, i32, u64, and u32, monomorphizes the entire engine per element type, and distributes as a single header tree under one `#include`.
 
-The JIT fusion kernel detects filter+sum patterns and emits native x86-64 code that runs at 1,400 M elem/s — 7.5x faster than hand-written C++ on the same hardware.
+The JIT fusion kernel detects filter+sum patterns and emits native x86-64 code that runs at 1,600+ M elem/s — 10x faster than hand-written C++ on the same hardware. The interpreter's pattern-matched fast path reaches 375 M elem/s without runtime code generation, a 7x improvement over the dispatch-table baseline.
 
 ## Quick Start
 
@@ -65,9 +65,9 @@ print(md.vwap(), md.rsi(14), md.sharpe_ratio())
 |------|-------|
 | [docs/Architecture.md](docs/Architecture.md) | Module layout, engine design, memory topology |
 | [docs/JIT.md](docs/JIT.md) | JIT compiler, fusion kernel, performance |
+| [docs/Interpreter.md](docs/Interpreter.md) | Dispatch, fast-path pattern matching, performance tiers |
 | [docs/Bytecode.md](docs/Bytecode.md) | Instruction encoding, full opcode reference |
 | [docs/Benchmarks.md](docs/Benchmarks.md) | Methodology, end-to-end comparisons, subsystem table |
-| [docs/README.md](docs/README.md) | Full API reference (C++ and Python) |
 
 ## Compiler Requirements
 

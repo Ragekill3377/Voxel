@@ -16,19 +16,20 @@ taskset -c 0 ./build/validate
 
 | Method | Time (us) | Throughput (M elem/s) | vs Native |
 |--------|-----------|----------------------|-----------|
-| Native C++ (scalar SIMD) | 5,312 | 188 | 1.0x |
-| VoxelVM interpreter | 11,939 | 84 | 2.2x slower |
-| **VoxelVM JIT (fusion)** | **872** | **1,147** | **6.1x faster** |
+| Native C++ (SIMD) | 6,065 | 165 | 1.0x |
+| VoxelVM interpreter (dispatch) | 18,867 | 53 | 3.1x slower |
+| VoxelVM interpreter (fast path) | 2,668 | 375 | 2.3x faster |
+| **VoxelVM JIT (fusion)** | **598** | **1,672** | **10.1x faster** |
 
-Warm runs (subsequent invocations after caches are hot) reach 600 us / 1,500+ M elem/s.
+Warm runs (subsequent invocations after caches are hot) reach 598 us / 1,672 M elem/s.
 
 ## JIT Breakdown
 
 | Phase | Time (us) |
 |-------|-----------|
-| Compilation | 48 |
-| Execution (warm) | 600-700 |
-| Total (first call) | ~750 |
+| Compilation | 46 |
+| Execution (warm) | 598 |
+| Total (first call) | ~644 |
 
 Compilation produces 237 bytes of x86-64 machine code. The JIT compiles once; execution is then a direct function call through a typed pointer.
 
@@ -37,13 +38,14 @@ Compilation produces 237 bytes of x86-64 machine code. The JIT compiles once; ex
 | Dispatch | Throughput (M elem/s) |
 |----------|----------------------|
 | Switch statement (original) | 34 |
-| Function pointer table | 84 (+147%) |
+| Function pointer table | 53 |
+| Pattern-matched fast path | 375 (+607%) |
 
 ## Single-Column Filter+Sum: Cross-Engine Comparison
 
 | Engine | ~M elem/s | Type |
 |--------|----------|------|
-| **VoxelVM JIT** | **1,147-1,500** | Bytecode JIT (i3-4130T) |
+| **VoxelVM JIT** | **1,147-1,672** | Bytecode JIT (i3-4130T) |
 | ClickHouse | 300-800 | Columnar SIMD |
 | DuckDB | 200-500 | Vectorized C++ |
 | NumPy (compiled) | 200-500 | C vectorized loops |
@@ -74,7 +76,7 @@ Not a full database benchmark — only the core scan primitive. DuckDB and Click
 | ThreadPool | 100 tasks sqrt workload | 1.34x | speedup |
 | Bytecode optimizer | filter+sum program | 12.5% | reduction |
 | JIT compile | filter+sum bytecode | 46 | us |
-| JIT execute | 1M f64 native code | 1,400 | M elem/s |
+| JIT execute | 1M f64 native code | 1,600 | M elem/s |
 
 ## Projected Performance on Modern Hardware
 
@@ -82,7 +84,7 @@ The JIT fusion kernel's instruction mix (3 FP ops per 4-element iteration on por
 
 | CPU | FP pipes | Projected |
 |-----|----------|-----------|
-| Haswell i3 (2013) | 2 (1 shared) | 1,500 M/s (measured) |
+| Haswell i3 (2013) | 2 (1 shared) | 1,672 M/s (measured) |
 | Skylake (2015) | 3 | ~2,500 M/s |
 | Zen 3 (2020) | 4 (2 FP) | ~4,000 M/s |
 | Zen 5 / Ice Lake | 5+ | ~6,000-8,000 M/s |

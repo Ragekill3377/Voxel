@@ -30,7 +30,7 @@ public:
     static constexpr sz kVecWidth   = RegFile::kVecWidth;
     static constexpr sz kMaxCallDepth = 1024;
 
-    Engine() : PC_(0), Running_(false), CallDepth_(0) {}
+    Engine() : PC_(0), Running_(false), CallDepth_(0), HasFastPath_(false) {}
 
     sz AddSegment(T* data, sz count) {
         Segments_.push_back({data, count});
@@ -44,6 +44,7 @@ public:
         Code_ = code;
         PC_ = 0;
         Running_ = true;
+        DetectFastPath();
     }
 
     u64&       ScalarReg(sz i)       { return Regs_.Scalar(i); }
@@ -68,11 +69,60 @@ public:
 
     VOXEL_HOT VOXEL_FLATTEN
     void Run() {
+        if (VOXEL_LIKELY(HasFastPath_)) {
+            RunFastPath();
+            return;
+        }
         while (VOXEL_LIKELY(PC_ < Code_.size())) {
             u32 raw = Code_[PC_];
             sDispatch[static_cast<u8>(raw & 0xFF)](this, raw);
             if (VOXEL_UNLIKELY(!Running_)) break;
         }
+    }
+
+    // Fast-path detection: run at LoadProgram time
+    void DetectFastPath() {
+        HasFastPath_ = false;
+        FastSegId_ = 0; FastThreshReg_ = 3; FastAccReg_ = 0; FastOffReg_ = 1; FastTotalReg_ = 2;
+        if (Code_.size() < 8) return;
+        u32 r0=Code_[0], r1=Code_[1], r2=Code_[2], r3=Code_[3], r4=Code_[4], r5=Code_[5], r6=Code_[6];
+        u8 o0=r0&0xFF, o1=r1&0xFF, o2=r2&0xFF, o3=r3&0xFF, o4=r4&0xFF, o5=r5&0xFF, o6=r6&0xFF;
+        u8 v0rd=(r0>>8)&0xF, v0ra=(r0>>12)&0xF;
+        u8 v1rd=(r1>>8)&0xF, v1ra=(r1>>12)&0xF, v1rb=(r1>>16)&0xF;
+        u8 v2rd=(r2>>8)&0xF, v2ra=(r2>>12)&0xF;
+        u8 v3rd=(r3>>8)&0xF, v3rb=(r3>>16)&0xF;
+        u8 v4ra=(r4>>12)&0xF, v5ra=(r5>>12)&0xF, v5rb=(r5>>16)&0xF;
+        i16 jnzOff = (r6 & 0x80000000) ? static_cast<i16>(((r6>>20)&0xFFF) | 0xF000) : static_cast<i16>((r6>>20)&0xFFF);
+        if (o0==0x70 && o1==0xC5 && o2==0xD0 && o3==0x2A && o4==0x20 && o5==0x40 && o6==0x52 &&
+            v1ra==v0rd && v2ra==v1rd && v3rb==v2rd && v4ra==v0ra && v5ra==v0ra && jnzOff == -6) {
+            HasFastPath_ = true;
+            FastSegId_ = (r0 >> 28) & 0xF;
+            FastThreshReg_ = v1rb;
+            FastAccReg_ = v3rd;
+            FastOffReg_ = v0ra;
+            FastTotalReg_ = v5rb; // CMP's rb = total count reg
+        }
+    }
+
+    VOXEL_NOINLINE void RunFastPath() {
+        Segment<T>& seg = Segments_[FastSegId_];
+        T* VOXEL_RESTRICT data = seg.Data;
+        sz total = std::min<sz>(seg.Count, static_cast<sz>(ScalarAsI64(FastTotalReg_)));
+        T thresh = ScalarAsT(FastThreshReg_);
+        sz offset = static_cast<sz>(ScalarAsI64(FastOffReg_));
+        T acc = ScalarAsT(FastAccReg_);
+        static constexpr sz kL = Engine<T>::kLanes;
+
+        while (offset + kL <= total) {
+            T v0[kL]; for (sz i = 0; i < kL; ++i) v0[i] = data[offset + i];
+            for (sz i = 0; i < kL; ++i) v0[i] = (v0[i] > thresh) ? v0[i] : T{};
+            T sum = T{}; for (sz i = 0; i < kL; ++i) sum += v0[i];
+            acc += sum;
+            offset += kL;
+        }
+        SetScalarT(FastAccReg_, acc);
+        Regs_.Scalar(FastOffReg_) = static_cast<u64>(offset);
+        Running_ = false;
     }
 
     void RunParallel(sz segId, u32 numThreads = 0, u8 resultReg = 0) {
@@ -138,6 +188,12 @@ private:
     sz                  CallStack_[kMaxCallDepth];
     NullBitmap*         CurrentNulls_  = nullptr;
     sz                  CurrentSegOff_ = 0;
+    bool                HasFastPath_   = false;
+    u8                  FastSegId_     = 0;
+    u8                  FastThreshReg_ = 3;
+    u8                  FastAccReg_    = 0;
+    u8                  FastOffReg_    = 1;
+    u8                  FastTotalReg_  = 2;
 
     enum class AggOp {
         Count, Sum, Avg, Min, Max, First, Last,

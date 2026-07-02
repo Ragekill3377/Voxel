@@ -65,7 +65,7 @@ int main() {
         f64 med = times[times.size()/2];
         std::cout << "Interpreter: " << med << " us, " << (N/(med/1e6)/1e6)
                   << " M/s, sum=" << result
-                  << " (" << (std::fabs(result-expected)<1e-6?"OK":"FAIL") << ")\n";
+                  << " (" << (std::fabs(result-expected) < expected * 1e-12 ? "OK":"FAIL") << ")\n";
     }
 
     // JIT
@@ -104,7 +104,7 @@ int main() {
         f64 med = times[times.size()/2];
         std::cout << "JIT:         " << med << " us, " << (N/(med/1e6)/1e6)
                   << " M/s, sum=" << result
-                  << " (" << (std::fabs(result-expected)<1e-6?"OK":"FAIL") << ")\n";
+                  << " (" << (std::fabs(result-expected) < expected * 1e-12 ? "OK":"FAIL") << ")\n";
         compiler->Release(func);
     }
 
@@ -125,7 +125,7 @@ int main() {
         f64 med = times[times.size()/2];
         std::cout << "Native C++:  " << med << " us, " << (N/(med/1e6)/1e6)
                   << " M/s, sum=" << result
-                  << " (" << (std::fabs(result-expected)<1e-6?"OK":"FAIL") << ")\n";
+                  << " (" << (std::fabs(result-expected) < expected * 1e-12 ? "OK":"FAIL") << ")\n";
     }
 
     std::cout << "\n=== Reproduce ===\n";
