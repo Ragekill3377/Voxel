@@ -31,7 +31,7 @@ The handwritten "native" C++ benchmark uses the SIMD abstraction layer (`simd::s
 
 ## Pattern Matching
 
-Pattern detection runs once at `LoadProgram()`. The `DetectFastPath()` method checks the first 7 instructions against the canonical filter+sum pattern:
+Pattern detection runs once at `LoadProgram()`. The `DetectFastPath()` method checks the first 7 instructions against the filter+sum pattern. More pattern templates (window-sum, time-window, filter+count) can be added following the same mechanism: detect the bytecode sequence, implement the equivalent C++ loop, route `Run()` accordingly.
 
 ```
 [0] VLOAD       rd=0, ra=1(must match [4]+[5] offset reg), segId, count

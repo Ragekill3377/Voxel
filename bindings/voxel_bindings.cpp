@@ -140,7 +140,17 @@ PYBIND11_MODULE(voxel_py, m) {
             sz n = e.WindowMean(static_cast<const f64*>(src.ptr), static_cast<sz>(arr.size()),
                                  static_cast<f64*>(dst.ptr), static_cast<sz>(out.size()), window);
             return n;
-        }, py::arg("data"), py::arg("out"), py::arg("window"));
+        }, py::arg("data"), py::arg("out"), py::arg("window"))
+        .def("time_window_sum", [](Engine<f64>& e, py::array_t<i64> timestamps,
+                                    py::array_t<f64> values, i64 startTime, i64 durationSec,
+                                    py::array_t<f64> out) {
+            auto ts = timestamps.request(); auto vv = values.request(); auto oo = out.request();
+            sz cnt = std::min<sz>(static_cast<sz>(timestamps.size()), static_cast<sz>(values.size()));
+            return e.TimeWindowSum(static_cast<const i64*>(ts.ptr), static_cast<const f64*>(vv.ptr),
+                                    cnt, startTime, durationSec, static_cast<f64*>(oo.ptr),
+                                    static_cast<sz>(out.size()));
+        }, py::arg("timestamps"), py::arg("values"), py::arg("start_time"),
+           py::arg("duration_sec"), py::arg("out"));
 
     // ---- Engine<i64> ----
     py::class_<Engine<i64>>(m, "EngineI64")

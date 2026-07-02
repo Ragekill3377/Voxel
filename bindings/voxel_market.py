@@ -202,6 +202,57 @@ class MarketData:
         histogram = macd_line - signal_line
         return {"macd": macd_line, "signal": signal_line, "histogram": histogram}
 
+    def time_ohlc(self, timestamps, duration_sec=3600):
+        """Resample tick data into time-indexed OHLC bars using VoxelVM.
+
+        Args:
+            timestamps: i64 array of unix timestamps (seconds)
+            duration_sec: bar duration in seconds (default 3600 = 1 hour)
+        """
+        if self._prices is None or timestamps is None:
+            raise ValueError("prices and timestamps required")
+        ts = np.asarray(timestamps, dtype=np.int64)
+        p = self._prices
+        N = len(p)
+        if N == 0:
+            return MarketData()
+        start = ts[0]
+        max_buckets = int((ts[-1] - start) / duration_sec) + 1
+        e = _vx.EngineF64()
+
+        # Bucketed volume sum
+        volumes = None
+        if self._volumes is not None:
+            volumes = np.zeros(max_buckets, dtype=np.float64)
+            e.time_window_sum(ts, self._volumes, start, duration_sec, volumes)
+
+        opens = np.zeros(max_buckets, dtype=np.float64)
+        highs  = np.zeros(max_buckets, dtype=np.float64)
+        lows   = np.full(max_buckets, np.inf, dtype=np.float64)
+        closes = np.zeros(max_buckets, dtype=np.float64)
+
+        last_bucket = -1
+        for i in range(N):
+            b = int((ts[i] - start) // duration_sec)
+            if b != last_bucket:
+                if 0 <= b < max_buckets:
+                    opens[b] = p[i]
+                    if last_bucket >= 0 and last_bucket < max_buckets:
+                        closes[last_bucket] = p[i - 1]
+                last_bucket = b
+            if 0 <= b < max_buckets:
+                highs[b] = max(highs[b], p[i])
+                lows[b] = min(lows[b], p[i])
+        if last_bucket >= 0 and last_bucket < max_buckets:
+            closes[last_bucket] = p[-1]
+        for i in range(max_buckets):
+            if np.isinf(lows[i]): lows[i] = opens[i] if opens[i] > 0 else 0.0
+            if highs[i] == 0 and opens[i] > 0: highs[i] = opens[i]
+
+        return MarketData(opens=opens, highs=highs, lows=lows, closes=closes,
+                          volumes=volumes, prices=closes,
+                          timestamps=np.arange(max_buckets) * duration_sec + start)
+
     def resample_ohlc(self, window=100):
         """Resample tick data into OHLC bars."""
         if self._prices is None:

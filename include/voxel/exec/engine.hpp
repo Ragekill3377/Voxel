@@ -207,6 +207,25 @@ public:
         return n;
     }
 
+    /// Time-indexed window sum: partition (timestamp,value) pairs into
+    /// duration-sized buckets and sum values per bucket.
+    /// timestamps must be monotonic (non-decreasing). startTime is the
+    /// anchor for bucket boundaries. Returns number of buckets filled.
+    static sz TimeWindowSum(const i64* timestamps, const T* values, sz count,
+                            i64 startTime, i64 durationSec,
+                            T* out, sz outLen) {
+        if (durationSec <= 0 || count == 0 || outLen == 0) return 0;
+        sz maxBucket = 0;
+        for (sz i = 0; i < count; ++i) {
+            i64 bucket = (timestamps[i] - startTime) / durationSec;
+            if (bucket >= 0 && static_cast<sz>(bucket) < outLen) {
+                out[bucket] += values[i];
+                if (static_cast<sz>(bucket) > maxBucket) maxBucket = static_cast<sz>(bucket);
+            }
+        }
+        return maxBucket + 1;
+    }
+
 private:
 
     using DispatchFn = void (*)(Engine<T>*, u32 raw);
