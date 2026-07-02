@@ -226,6 +226,64 @@ public:
         return maxBucket + 1;
     }
 
+    /// Sliding window population stddev: two-pass per window.
+    static sz WindowStdDev(const T* data, sz count, T* out, sz outLen, u8 window) {
+        if (window < 2 || count < window) return 0;
+        sz nWindows = count - window + 1;
+        sz N = std::min<sz>(nWindows, outLen);
+        for (sz j = 0; j < N; ++j) {
+            T sum = T{};
+            for (sz k = 0; k < window; ++k) sum += data[j + k];
+            T mean = sum / static_cast<T>(window);
+            T ssq = T{};
+            for (sz k = 0; k < window; ++k) { T d = data[j + k] - mean; ssq += d * d; }
+            out[j] = std::sqrt(ssq / static_cast<T>(window));
+        }
+        return N;
+    }
+
+    /// Sliding window population variance.
+    static sz WindowVariance(const T* data, sz count, T* out, sz outLen, u8 window) {
+        if (window < 2 || count < window) return 0;
+        sz nWindows = count - window + 1;
+        sz N = std::min<sz>(nWindows, outLen);
+        for (sz j = 0; j < N; ++j) {
+            T sum = T{};
+            for (sz k = 0; k < window; ++k) sum += data[j + k];
+            T mean = sum / static_cast<T>(window);
+            T ssq = T{};
+            for (sz k = 0; k < window; ++k) { T d = data[j + k] - mean; ssq += d * d; }
+            out[j] = ssq / static_cast<T>(window);
+        }
+        return N;
+    }
+
+    /// Sliding window quantile with linear interpolation. quantilePct is 0.0-1.0.
+    static sz WindowQuantile(const T* data, sz count, T* out, sz outLen,
+                             u8 window, f64 quantilePct) {
+        if (window < 2 || count < window || quantilePct < 0.0 || quantilePct > 1.0) return 0;
+        sz nWindows = count - window + 1;
+        sz N = std::min<sz>(nWindows, outLen);
+        for (sz j = 0; j < N; ++j) {
+            T buf[128];
+            sz w = std::min<sz>(window, 128);
+            for (sz k = 0; k < w; ++k) buf[k] = data[j + k];
+            f64 pos = quantilePct * static_cast<f64>(w - 1);
+            sz lo = static_cast<sz>(pos);
+            if (lo >= w) lo = w - 1;
+            sz hi = lo + 1; if (hi >= w) hi = lo;
+            std::nth_element(buf, buf + lo, buf + w);
+            T vLo = buf[lo];
+            if (lo == hi) { out[j] = vLo; continue; }
+            T vHi = buf[lo + 1];
+            for (sz m = lo + 1; m < w; ++m)
+                if (buf[m] < vHi) vHi = buf[m];
+            f64 frac = pos - static_cast<f64>(lo);
+            out[j] = static_cast<T>(vLo + static_cast<T>(static_cast<f64>(vHi - vLo) * frac));
+        }
+        return N;
+    }
+
 private:
 
     using DispatchFn = void (*)(Engine<T>*, u32 raw);
@@ -2508,6 +2566,88 @@ private:
     }
 
     // ================================================================
+    // DISPATCH HANDLERS — WINDOW STREAMING MATH (0x97-0x99)
+    // ================================================================
+
+    VOXEL_ALWAYS_INLINE
+    static void HandleWSTD(Engine<T>* e, u32 raw) {
+        u8 vd = Rd(raw); u8 ra = Ra(raw); u16 imm12 = Imm12(raw);
+        u8 window = imm12 & 0xFF; u8 segId = (imm12 >> 8) & 0xF;
+        if (window < 2 || segId >= e->Segments_.size()) { e->PC_++; return; }
+        Segment<T>& seg = e->Segments_[segId];
+        sz offset = static_cast<sz>(e->ScalarAsI64(ra));
+        T* dst = e->Regs_.VecLanes<T>(vd);
+        for (sz j = 0; j < e->kLanes; ++j) {
+            sz start = offset + j;
+            if (start + window > seg.Count) { dst[j] = T{}; continue; }
+            // Two-pass: mean then stddev
+            T sum = T{};
+            for (sz k = 0; k < window; ++k) sum += seg.Data[start + k];
+            T mean = sum / static_cast<T>(window);
+            T ssq = T{};
+            for (sz k = 0; k < window; ++k) {
+                T d = seg.Data[start + k] - mean;
+                ssq += d * d;
+            }
+            dst[j] = std::sqrt(ssq / static_cast<T>(window));
+        }
+        sz advanced = std::min<sz>(e->kLanes, seg.Count > offset ? seg.Count - offset : 0);
+        e->Regs_.Scalar(ra) = static_cast<u64>(offset + advanced);
+        e->PC_++;
+    }
+
+    VOXEL_ALWAYS_INLINE
+    static void HandleWVARIANCE_W(Engine<T>* e, u32 raw) {
+        u8 vd = Rd(raw); u8 ra = Ra(raw); u16 imm12 = Imm12(raw);
+        u8 window = imm12 & 0xFF; u8 segId = (imm12 >> 8) & 0xF;
+        if (window < 2 || segId >= e->Segments_.size()) { e->PC_++; return; }
+        Segment<T>& seg = e->Segments_[segId];
+        sz offset = static_cast<sz>(e->ScalarAsI64(ra));
+        T* dst = e->Regs_.VecLanes<T>(vd);
+        for (sz j = 0; j < e->kLanes; ++j) {
+            sz start = offset + j;
+            if (start + window > seg.Count) { dst[j] = T{}; continue; }
+            T sum = T{};
+            for (sz k = 0; k < window; ++k) sum += seg.Data[start + k];
+            T mean = sum / static_cast<T>(window);
+            T ssq = T{};
+            for (sz k = 0; k < window; ++k) {
+                T d = seg.Data[start + k] - mean;
+                ssq += d * d;
+            }
+            dst[j] = ssq / static_cast<T>(window);
+        }
+        sz advanced = std::min<sz>(e->kLanes, seg.Count > offset ? seg.Count - offset : 0);
+        e->Regs_.Scalar(ra) = static_cast<u64>(offset + advanced);
+        e->PC_++;
+    }
+
+    VOXEL_ALWAYS_INLINE
+    static void HandleWQUANTILE(Engine<T>* e, u32 raw) {
+        u8 vd = Rd(raw); u8 ra = Ra(raw); u16 imm12 = Imm12(raw);
+        u8 window = imm12 & 0x1F; if (window == 0) window = 16;
+        u8 quantile = (imm12 >> 5) & 0x7; // 0-7 scale, maps to 0%/14%/29%/43%/57%/71%/86%/100%
+        u8 segId = (imm12 >> 8) & 0xF;
+        if (window < 2 || segId >= e->Segments_.size()) { e->PC_++; return; }
+        Segment<T>& seg = e->Segments_[segId];
+        sz offset = static_cast<sz>(e->ScalarAsI64(ra));
+        T* dst = e->Regs_.VecLanes<T>(vd);
+        for (sz j = 0; j < e->kLanes; ++j) {
+            sz start = offset + j;
+            if (start + window > seg.Count) { dst[j] = T{}; continue; }
+            T buf[32]; // max window = 32
+            for (sz k = 0; k < window; ++k) buf[k] = seg.Data[start + k];
+            sz idx = (quantile * window) / 7; // map 0-7 to 0..window-1
+            if (idx >= window) idx = window - 1;
+            std::nth_element(buf, buf + idx, buf + window);
+            dst[j] = buf[idx];
+        }
+        sz advanced = std::min<sz>(e->kLanes, seg.Count > offset ? seg.Count - offset : 0);
+        e->Regs_.Scalar(ra) = static_cast<u64>(offset + advanced);
+        e->PC_++;
+    }
+
+    // ================================================================
     // DISPATCH HANDLERS — VECTOR COMPARISON (0xA0-0xAF)
     // ================================================================
 
@@ -3259,9 +3399,9 @@ private:
         &HandleVSQRT, &HandleVRSQRT, &HandleVRCP, &HandleVPOW,
         /* 0x90-0x9F: Vector-Scalar Arithmetic */
         &HandleVSADD, &HandleVSSUB, &HandleVSMUL, &HandleVSDIV,
-        &HandleVSMOD, &HandleVSMIN, &HandleVSMAX, &HandleINVALID,
-        &HandleINVALID, &HandleINVALID, &HandleINVALID, &HandleINVALID,
-        &HandleINVALID, &HandleINVALID, &HandleINVALID, &HandleINVALID,
+         &HandleVSMOD, &HandleVSMIN, &HandleVSMAX, &HandleWSTD,
+         &HandleWVARIANCE_W, &HandleWQUANTILE, &HandleINVALID, &HandleINVALID,
+         &HandleINVALID, &HandleINVALID, &HandleINVALID, &HandleINVALID,
         /* 0xA0-0xAF: Vector Comparison */
         &HandleVCMPEQ, &HandleVCMPNE, &HandleVCMPLT, &HandleVCMPLE,
         &HandleVCMPGT, &HandleVCMPGE, &HandleVCMPNULL, &HandleVCMPNOTNULL,

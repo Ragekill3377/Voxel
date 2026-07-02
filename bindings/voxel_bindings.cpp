@@ -150,7 +150,24 @@ PYBIND11_MODULE(voxel_py, m) {
                                     cnt, startTime, durationSec, static_cast<f64*>(oo.ptr),
                                     static_cast<sz>(out.size()));
         }, py::arg("timestamps"), py::arg("values"), py::arg("start_time"),
-           py::arg("duration_sec"), py::arg("out"));
+           py::arg("duration_sec"), py::arg("out"))
+        .def("window_stddev", [](Engine<f64>& e, py::array_t<f64> arr, py::array_t<f64> out, u8 window) {
+            auto src = arr.request(); auto dst = out.request();
+            return e.WindowStdDev(static_cast<const f64*>(src.ptr), static_cast<sz>(arr.size()),
+                                   static_cast<f64*>(dst.ptr), static_cast<sz>(out.size()), window);
+        }, py::arg("data"), py::arg("out"), py::arg("window"))
+        .def("window_variance", [](Engine<f64>& e, py::array_t<f64> arr, py::array_t<f64> out, u8 window) {
+            auto src = arr.request(); auto dst = out.request();
+            return e.WindowVariance(static_cast<const f64*>(src.ptr), static_cast<sz>(arr.size()),
+                                     static_cast<f64*>(dst.ptr), static_cast<sz>(out.size()), window);
+        }, py::arg("data"), py::arg("out"), py::arg("window"))
+        .def("window_quantile", [](Engine<f64>& e, py::array_t<f64> arr, py::array_t<f64> out,
+                                    u8 window, f64 quantile) {
+            auto src = arr.request(); auto dst = out.request();
+            return e.WindowQuantile(static_cast<const f64*>(src.ptr), static_cast<sz>(arr.size()),
+                                     static_cast<f64*>(dst.ptr), static_cast<sz>(out.size()),
+                                     window, quantile);
+        }, py::arg("data"), py::arg("out"), py::arg("window"), py::arg("quantile"));
 
     // ---- Engine<i64> ----
     py::class_<Engine<i64>>(m, "EngineI64")

@@ -166,6 +166,11 @@ enum class Opcode : u8 {
     VSMIN        = 0x95,
     VSMAX        = 0x96,
 
+    // Window streaming math (0x97-0x9F) — single-pass over segment data
+    WSTD          = 0x97,    // sliding window population stddev
+    WVARIANCE_W   = 0x98,    // sliding window population variance
+    WQUANTILE     = 0x99,    // sliding window quantile (0-100% in imm12)
+
     // --- Vector Comparison (0xA0-0xAF) ---
     VCMPEQ       = 0xA0,
     VCMPNE       = 0xA1,
@@ -358,6 +363,9 @@ inline constexpr const char* OpcodeName(Opcode op) {
     case Opcode::VSMUL: return "vsmul"; case Opcode::VSDIV: return "vsdiv";
     case Opcode::VSMOD: return "vsmod"; case Opcode::VSMIN: return "vsmin";
     case Opcode::VSMAX: return "vsmax";
+    case Opcode::WSTD: return "wstd";
+    case Opcode::WVARIANCE_W: return "wvariance";
+    case Opcode::WQUANTILE: return "wquantile";
     case Opcode::VCMPEQ: return "vcmpeq"; case Opcode::VCMPNE: return "vcmpne";
     case Opcode::VCMPLT: return "vcmplt"; case Opcode::VCMPLE: return "vcmple";
     case Opcode::VCMPGT: return "vcmpgt"; case Opcode::VCMPGE: return "vcmpge";

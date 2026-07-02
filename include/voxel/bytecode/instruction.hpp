@@ -862,6 +862,18 @@ struct Instruction {
         return Instruction{Encode(Opcode::WINDOW_MEAN, vd, ra, 0,
             static_cast<u16>((window & 0xFF) | ((segId & 0xF) << 8)))};
     }
+    static Instruction WStd(u8 vd, u8 ra, u8 segId, u8 window) {
+        return Instruction{Encode(Opcode::WSTD, vd, ra, 0,
+            static_cast<u16>((window & 0xFF) | ((segId & 0xF) << 8)))};
+    }
+    static Instruction WVarianceW(u8 vd, u8 ra, u8 segId, u8 window) {
+        return Instruction{Encode(Opcode::WVARIANCE_W, vd, ra, 0,
+            static_cast<u16>((window & 0xFF) | ((segId & 0xF) << 8)))};
+    }
+    static Instruction WQuantile(u8 vd, u8 ra, u8 segId, u8 window, u8 quantile) {
+        return Instruction{Encode(Opcode::WQUANTILE, vd, ra, 0,
+            static_cast<u16>((quantile & 0x7F) | ((window & 0x1F) << 7) | ((segId & 0xF) << 8)))};
+    }
 
     // ====================================================================
     // Aggregate Operators — 0xE0..0xEF

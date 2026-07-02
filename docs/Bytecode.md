@@ -265,7 +265,15 @@ For vector loads and stores, imm12 is subdivided: bits 11:8 encode the segment I
 | WINDOW_SUM | 0xDE | Vd[i] = sum(seg[i..i+win-1]), sliding window sum |
 | WINDOW_MEAN | 0xDF | Vd[i] = WINDOW_SUM / window, sliding window mean |
 
-Window-streaming ops (0xDD-0xDF) read from an engine segment and fill a vector register with kLanes windowed results. They advance an offset scalar register by kLanes on each call, designed to run in a tight bytecode loop with VSTORE to materialize the full output array. See `Engine::WindowDelta/WindowSum/WindowMean` for the direct static-method API that computes the full array in one call.
+### Window Streaming Math (0x97-0x99)
+
+| Opcode | Hex | Description |
+|--------|-----|-------------|
+| WSTD | 0x97 | Vd[i] = stddev(window[i]), streaming via two-pass |
+| WVARIANCE_W | 0x98 | Vd[i] = variance(window[i]), streaming via two-pass |
+| WQUANTILE | 0x99 | Vd[i] = quantile(window[i], pct), linear interpolation |
+
+Window-streaming ops (0x97-0x99, 0xDD-0xDF) read from an engine segment and fill a vector register with kLanes windowed results. They advance an offset scalar register by kLanes on each call. See `Engine::WindowSum/WindowMean/WindowStdDev/WindowVariance/WindowQuantile` for the direct static-method API.
 
 ### Aggregate (0xE0-0xEF)
 

@@ -101,15 +101,15 @@ class MarketData:
         return np.log(p[period:] / p[:-period])
 
     def volatility(self, window=20):
-        """Rolling historical volatility (annualized)."""
+        """Rolling historical volatility (annualized) — VoxelVM-accelerated."""
         r = self.returns()
         if len(r) < window:
             return np.nan
-        # Rolling std across windows using vectorized numpy
-        rolling_std = np.array([
-            np.std(r[i:i+window]) for i in range(0, len(r) - window + 1, window)
-        ])
-        return np.mean(rolling_std) * np.sqrt(365 * 24)  # annualize for hourly data
+        n_out = len(r) - window + 1
+        stddev = np.zeros(n_out, dtype=np.float64)
+        e = _vx.EngineF64()
+        e.window_stddev(r, stddev, window)
+        return np.mean(stddev) * np.sqrt(365 * 24)  # annualize for hourly data
 
     def rolling_sum(self, window, data=None):
         """Rolling window sum."""
@@ -132,12 +132,20 @@ class MarketData:
         return np.array([np.min(d[i:i+window]) for i in range(len(d) - window + 1)])
 
     def bollinger_bands(self, window=20, num_std=2.0, data=None):
-        """Bollinger Bands: middle, upper, lower."""
+        """Bollinger Bands — VoxelVM-accelerated via WINDOW_MEAN + WINDOW_STDDEV."""
         d = data if data is not None else self._prices
-        middle = self.rolling_mean(window, d)
-        rolling_std = np.array([np.std(d[i:i+window]) for i in range(len(d) - window + 1)])
-        upper = middle + num_std * rolling_std
-        lower = middle - num_std * rolling_std
+        if d is None:
+            raise ValueError("prices required")
+        if len(d) < window:
+            return {"middle": np.array([]), "upper": np.array([]), "lower": np.array([])}
+        n_out = len(d) - window + 1
+        middle = np.zeros(n_out, dtype=np.float64)
+        stddev = np.zeros(n_out, dtype=np.float64)
+        e = _vx.EngineF64()
+        e.window_mean(d, middle, window)
+        e.window_stddev(d, stddev, window)
+        upper = middle + num_std * stddev
+        lower = middle - num_std * stddev
         return {"middle": middle, "upper": upper, "lower": lower}
 
     def rsi(self, window=14, data=None):
@@ -275,6 +283,17 @@ class MarketData:
         r = self.returns()
         excess = r - risk_free / (365 * 24)
         return np.mean(excess) / (np.std(excess) + 1e-10) * np.sqrt(365 * 24)
+
+    def var(self, window=250, confidence=0.95):
+        """Value at Risk — historical method, VoxelVM-accelerated quantile."""
+        r = self.returns()
+        if len(r) < window:
+            return np.nan
+        n_out = len(r) - window + 1
+        var_series = np.zeros(n_out, dtype=np.float64)
+        e = _vx.EngineF64()
+        e.window_quantile(r, var_series, window, 1.0 - confidence)
+        return var_series
 
     def max_drawdown(self, data=None):
         """Maximum drawdown from peak."""

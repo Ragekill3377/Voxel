@@ -49,6 +49,23 @@ The constraints are strict: VLOAD's offset register must appear as the target of
 
 Programs that do not match the filter+sum pattern execute through the dispatch table as before. All 208 opcodes are supported. The fast path is an optimization, not a replacement. Adding more patterns (filter+count, filter+min/max, filter with mask register, multi-segment joins) follows the same approach: detect the bytecode sequence, implement the equivalent C++ loop, route `Run()` accordingly.
 
+## Window Family (static API)
+
+For programs that don't need bytecode interpretation, the engine exposes six static methods that compute full-array windowed results in one call:
+
+| Method | Output | Benchmark (1M, w=20) |
+|--------|--------|----------------------|
+| `WindowSum` | sliding sum | 12 ms |
+| `WindowMean` | sliding mean | 15 ms |
+| `WindowDelta` | adjacent diff | 2 ms |
+| `WindowStdDev` | sliding stddev | 39 ms |
+| `WindowVariance` | sliding variance | 37 ms |
+| `WindowQuantile` | sliding quantile | 1000 ms (w=100) |
+
+All six are available as `EngineF64` methods in Python (`engine.window_mean(data, out, window)`) and as `Engine<T>::WindowMean(...)` in C++. They operate on raw pointers — no heap allocation, no bytecode dispatch, GCC auto-vectorizes.
+
+The bytecode opcodes (WDELTA, WINDOW_SUM, WINDOW_MEAN, WSTD, WVARIANCE_W, WQUANTILE) implement the same algorithms as per-call handlers in the dispatch table. The static methods are the recommended API for single-pass computation; the bytecode ops exist for programs that embed window ops within larger query plans.
+
 ## Performance Tier Roadmap
 
 | Tier | Mechanism | Target | Status |
