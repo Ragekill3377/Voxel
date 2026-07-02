@@ -74,18 +74,37 @@ public class VoxelBench {
             }
 
             System.out.printf("Dataset: %d f64, threshold %.0f, expected %.3f\n", N, threshold, expectedSum);
+            System.out.flush();
+
+            // Quick test with 8-element array first
+            System.out.println("Quick test..."); System.out.flush();
+            try (var smallArena = Arena.ofConfined()) {
+                var testData = smallArena.allocate(8 * 8);
+                double[] testVals = {1,2,3,4,5,6,7,8};
+                for (int i = 0; i < 8; i++) testData.setAtIndex(ValueLayout.JAVA_DOUBLE, i, testVals[i]);
+                double testResult = (double) jitRun.invoke(codeSeg, (long)codeRaw.length, testData, 8L, 4.0);
+                System.out.printf("  8-element test: %.1f (expected 26.0) %s\n", testResult,
+                    Math.abs(testResult - 26.0) < 1e-6 ? "OK" : "FAIL");
+                System.out.flush();
+            }
+            System.out.println("Quick test done"); System.out.flush();
+
+            // Full benchmark
+            System.out.println("Warmup..."); System.out.flush();
+            jitRun.invoke(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
+            System.out.println("Warmup done"); System.out.flush();
 
             // Warmup
-            jitRun.invokeExact(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
+            jitRun.invoke(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
 
             // Measured
             for (int i = 0; i < 3; i++) {
                 long t0 = System.nanoTime();
-                double result = (double) jitRun.invokeExact(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
+                double result = (double) jitRun.invoke(codeSeg, (long) codeRaw.length, dataSeg, (long) N, threshold);
                 long t1 = System.nanoTime();
                 double us = (t1 - t0) / 1000.0;
                 double mps = N / (us / 1e6) / 1e6;
-                boolean ok = Math.abs(result - expectedSum) < 1e-6;
+                boolean ok = Math.abs(result - expectedSum) < expectedSum * 1e-12;
                 System.out.printf("  Java JIT run %d: %.0f us, %.0f M/s, %s\n", i+1, us, mps, ok ? "OK" : "FAIL");
             }
         }
