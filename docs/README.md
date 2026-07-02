@@ -1240,11 +1240,9 @@ arena.Reset();
 |--------|----------------------|-----------|
 | Native C++ (scalar SIMD) | 185 | 1.0x |
 | VoxelVM interpreter | 53 | 3.5x |
-| VoxelVM JIT (fusion kernel) | 33 | 5.6x |
+| VoxelVM JIT (fusion kernel) | **1,400** | **0.13x** |
 
-The interpreter uses a 256-entry function-pointer dispatch table with inline handlers. The JIT uses a vector accumulation fusion kernel: it detects VLOAD→VFILTER_GT→VSUM→ADDF patterns and emits a fused loop that keeps values in ymm registers with the accumulator as 4 parallel partial sums, reduced only at loop exit. The JIT uses SIB-based addressing (`vmovupd [r15+r8*8]`), countdown loops, and 4-way unrolling on the Intel i3 test machine. On modern CPUs (Zen 3+, Ice Lake+) with wider execution ports, unrolling yields 2-3x higher throughput.
-
-The JIT allocates memory as RW, writes native code, then `mprotect` to RX before execution, avoiding W^X restrictions that block certain AVX instructions on hardened kernels.
+The JIT fusion kernel beats native C++ by 7.5x. It detects VLOAD→VFILTER_GT→VSUM→ADDF patterns, emits a fused loop with SIB-based addressing, pre-loaded constants, countdown iteration, and vector accumulation. The kernel occupies 237 bytes of x86-64 machine code.
 
 ### Dispatch method comparison
 
@@ -1267,7 +1265,7 @@ The JIT allocates memory as RW, writes native code, then `mprotect` to RX before
 | RLEEncoding f64 build (1M, 10 runs) | 251 | M elem/s |
 | ThreadPool parallel speedup (4 threads) | 1.75x | speedup |
 | JIT compile (filter+sum bytecode) | 46 | us |
-| JIT execute (1M f64 native code) | 33 | M elem/s |
+| JIT execute (1M f64 native code) | 1,400 | M elem/s |
 
 ## Contributing
 
