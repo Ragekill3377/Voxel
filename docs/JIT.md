@@ -91,4 +91,4 @@ During development, four bugs prevented the fusion kernel from executing:
 
 ## Performance
 
-On a Haswell i3-4130T (2.90 GHz, 2013), the fused kernel runs at 1,672 M elem/s — 10x faster than hand-written C++, 31x faster than the dispatch-table interpreter, 4.5x faster than the pattern-matched interpreter fast path, on the same dataset. The kernel occupies 237 bytes of x86-64 code. On modern hardware (Zen 3+, Ice Lake+) with wider execution ports, 4-way and 8-way unrolling project to 5-8 billion elem/s.
+On a Haswell i3-4130T (2.90 GHz, 2013), the fused kernel runs at 1,672 M elem/s — matching hand-tuned AVX2 intrinsics, 10x faster than scalar C++, 31x faster than the dispatch-table interpreter, 4.5x faster than the pattern-matched interpreter fast path. The kernel occupies 237 bytes of x86-64 code. On modern hardware (Zen 3+, Ice Lake+) with wider execution ports, 4-way and 8-way unrolling project to 5-8 billion elem/s.

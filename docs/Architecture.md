@@ -65,7 +65,7 @@ The engine supports `RunParallel(segId, numThreads, resultReg)` for data-paralle
 
 See [JIT.md](JIT.md) for the full JIT story.
 
-In brief: The x86-64 backend emits actual machine code bytes handling REX, VEX2, VEX3, ModR/M, and SIB encoding. The basic-block compiler performs liveness analysis and register allocation. The fusion kernel detects filter+sum patterns and generates a fused loop that beats native C++ by 10x.
+In brief: The x86-64 backend emits actual machine code bytes handling REX, VEX2, VEX3, ModR/M, and SIB encoding. The basic-block compiler performs liveness analysis and register allocation. The fusion kernel detects filter+sum patterns and generates a fused loop that matches hand-tuned AVX2 intrinsics — 10x faster than scalar C++ because the JIT eliminates every per-opcode dispatch and regfile memory access.
 
 ## SIMD Layer
 

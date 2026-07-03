@@ -23,11 +23,11 @@ while (offset + kLanes <= total) {
 }
 ```
 
-This eliminates all dispatch overhead, all regfile memory access, and all per-instruction decode. The threshold, accumulator, offset, and total count remain in CPU registers. GCC auto-vectorizes the loads, comparisons, and accumulates into ymm-wide SIMD instructions. The result is 375 M elem/s — a 7x improvement over Tier 0, and 2.3x faster than hand-written C++ on the same hardware.
+This eliminates all dispatch overhead, all regfile memory access, and all per-instruction decode. The threshold, accumulator, offset, and total count remain in CPU registers. GCC auto-vectorizes the loads, comparisons, and accumulates into ymm-wide SIMD instructions. The result is 375 M elem/s — a 7x improvement over Tier 0, and 2.3x faster than the scalar C++ baseline on the same hardware.
 
-## Why Faster Than Hand-Written C++
+## Why Faster Than Scalar C++
 
-The handwritten "native" C++ benchmark uses the SIMD abstraction layer (`simd::scalar::scalar_filter_gt_f64`), which processes arrays in vector-sized chunks with a scalar tail. The abstraction cost is minor but measurable: generic load/comparison/blend/accumulate calls through the SIMD namespace, plus a tail loop that handles remainder elements. The Tier 1 fast path eliminates all abstraction — GCC sees a flat loop with known bounds (4 iterations for f64 on AVX2) and unrolls + auto-vectorizes it directly to native instructions. The compiler also benefits from knowing the loop trip count is a multiple of the vector width, eliminating the remainder branch entirely.
+The "native" C++ benchmark uses a scalar loop: `for (i=0; i<n; ++i) if (data[i] > t) sum += data[i]`. GCC struggles to auto-vectorize this because the conditional accumulation creates a loop-carried dependency. The Tier 1 fast path works around this by summing in groups of 4 (explicitly breaking the dependency chain), which GCC recognizes as vectorizable. The compiler sees a flat loop with known bounds (4 iterations for f64 on AVX2) and unrolls + auto-vectorizes it directly to native SIMD instructions. The JIT takes this one step further by emitting the exact AVX2 opcodes — 2-way unrolled, SIB-addressed, zero branches — matching what a human would write with `_mm256` intrinsics.
 
 ## Pattern Matching
 

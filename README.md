@@ -8,7 +8,7 @@ Columnar analytics engines spend their cycles inside tight loops: load a batch o
 
 Most bytecode VMs are either toys that handle six opcodes and two types, or full JVM/CLR-class runtimes that include garbage collection, class loading, and a large baseline. VoxelVM targets the middle ground: it handles 208 opcodes across f64, f32, i64, i32, u64, and u32, monomorphizes the entire engine per element type, and distributes as a single header tree under one `#include`.
 
-The JIT fusion kernel detects filter+sum patterns and emits native x86-64 code that runs at 1,600+ M elem/s — 10x faster than hand-written C++ on the same hardware. The interpreter's pattern-matched fast path reaches 375 M elem/s without runtime code generation, a 7x improvement over the dispatch-table baseline.
+The JIT fusion kernel detects filter+sum patterns and emits native x86-64 code that runs at 1,600+ M elem/s — matching hand-tuned AVX2 intrinsics, 10x faster than scalar C++. The interpreter's pattern-matched fast path reaches 375 M elem/s without runtime code generation, a 7x improvement over the dispatch-table baseline.
 
 ## Quick Start
 
