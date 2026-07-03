@@ -20,6 +20,7 @@ cmake --build build
 ./build/voxel-demo        # 30 subsystem benchmarks with ground-truth checks
 ./build/voxel-test         # 22-subsystem validation suite
 ./build/voxel-jit-test     # JIT correctness: interpreter vs native
+python3 examples/taxi_bench.py  # DuckDB comparison (NYC Taxi 3M rows)
 ctest --test-dir build     # all three
 ```
 

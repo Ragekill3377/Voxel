@@ -79,6 +79,24 @@ Not a full database benchmark — only the core scan primitive. DuckDB and Click
 | JIT compile | filter+sum bytecode | 46 | us |
 | JIT execute | 1M f64 native code | 1,600 | M elem/s |
 
+## External Comparison: DuckDB on NYC Yellow Taxi
+
+Dataset: NYC Yellow Taxi, January 2024 (3.0M rows, 19 columns, 47.6 MB Parquet). Both engines operate on identical in-memory data. 5 warmup + 20 measured iterations, CPU pinned to core 0, median reported. Full methodology and verification in `examples/taxi_bench.py`.
+
+| Query | DuckDB 1.5.4 (ms) | VoxelVM (ms) | Ratio | Winner |
+|-------|-------------------|--------------|-------|--------|
+| SUM(fare) | 8.9 | 1.8 | 4.9x | VoxelVM |
+| SUM(fare) WHERE fare>20 | 37.6 | 7.9 | 4.8x | VoxelVM |
+| SUM(fare) WHERE fare>50 (JIT) | 37.1 | 2.0 | 18.3x | VoxelVM |
+| MIN(fare) | 26.9 | 1.8 | 14.6x | VoxelVM |
+| MAX(fare) | 26.9 | 1.9 | 14.1x | VoxelVM |
+| WindowMean(fare, w=14) | 1069 | 28 | 37.9x | VoxelVM |
+| WindowStdDev(fare, w=20) | 901 | 122 | 7.4x | VoxelVM |
+
+All results verified correct within floating-point tolerance. Window ops use a relaxed 1e-4 relative tolerance (FP accumulation order differs). GROUP BY and compound-filter benchmarks excluded because VoxelVM's implementation used Python loops rather than engine bytecode.
+
+Reproduce: `python3 examples/taxi_bench.py` (requires `pip install duckdb pyarrow` and Yellow Taxi Jan 2024 parquet).
+
 ## Projected Performance on Modern Hardware
 
 The JIT fusion kernel's instruction mix (3 FP ops per 4-element iteration on port 5) is the bottleneck on Haswell. On CPUs with wider execution ports:
