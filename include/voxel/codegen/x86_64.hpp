@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstring>
 #include <cstdint>
+#include <chrono>
 #include <unordered_map>
 #include <unordered_set>
 #include <bitset>
@@ -1244,6 +1245,9 @@ public:
     bool Compile(const u32* bytecode, sz bytecodeSize, JitFunction& out) override
     {
         (void)bytecodeSize;
+        using Clock = std::chrono::high_resolution_clock;
+        auto tTotal = Clock::now();
+
         std::vector<u8> code;
         code.reserve(bytecodeSize * 64);
         X64Assembler a(code);
@@ -1487,6 +1491,8 @@ public:
             }
         }
 
+        auto tAfterLiveness = Clock::now();
+
         // ------------------------------------------------------------
         // Step 3: Per-block register allocation
         // ------------------------------------------------------------
@@ -1532,6 +1538,8 @@ public:
                 }
             }
         }
+
+        auto tAfterRegAlloc = Clock::now();
 
         // ------------------------------------------------------------
         // Step 4: Code emission
@@ -2053,6 +2061,8 @@ public:
         a.PopReg(static_cast<u8>(Reg64::RBP));
         a.Ret();
 
+        auto tAfterCodeEmit = Clock::now();
+
         // ------------------------------------------------------------
         // Allocate executable memory and copy code
         // ------------------------------------------------------------
@@ -2063,6 +2073,18 @@ public:
 
         std::memcpy(execMem, code.data(), codeLength);
         mm.MakeExecutable(execMem, codeLength);
+
+        auto tAfterProtect = Clock::now();
+
+        // Store phase timings
+        out.BlockLivenessUs = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(tAfterLiveness - tTotal).count());
+        out.RegAllocUs = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(tAfterRegAlloc - tAfterLiveness).count());
+        out.CodeEmitUs = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(tAfterCodeEmit - tAfterRegAlloc).count());
+        out.ProtectUs = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::microseconds>(tAfterProtect - tAfterCodeEmit).count());
 
         out.CodePtr  = execMem;
         out.CodeSize = codeLength;

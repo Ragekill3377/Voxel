@@ -115,6 +115,12 @@ int main()
                 bool pass  = delta < expectedSum * 1e-12;
 
                 std::cout << "JIT compile:  " << compileUs << " us  (" << func.CodeSize << " bytes)\n";
+                if (func.BlockLivenessUs || func.RegAllocUs || func.CodeEmitUs || func.ProtectUs) {
+                    std::cout << "  Block+liveness: " << func.BlockLivenessUs << " us\n";
+                    std::cout << "  Reg allocation: " << func.RegAllocUs << " us\n";
+                    std::cout << "  Code emission:  " << func.CodeEmitUs << " us\n";
+                    std::cout << "  mprotect(RX):   " << func.ProtectUs << " us\n";
+                }
                 std::cout << "JIT execute:  " << execUs << " us  "
                           << (N / (execUs / 1e6) / 1e6) << " M elem/s\n";
                 std::cout << "JIT total:    " << (compileUs + execUs) << " us\n";

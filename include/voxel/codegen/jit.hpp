@@ -28,15 +28,25 @@ namespace codegen {
 // ============================================================================
 
 struct JitFunction {
-    void*  CodePtr;  // pointer to executable code block
-    sz     CodeSize; // size of the executable block in bytes
+    void*  CodePtr;
+    sz     CodeSize;
     using EntryFn = void (*)(void* regfile, void* segmentsBase, u64* segmentCounts);
     EntryFn Entry;
+
+    // Compilation phase timings, set by Compile(). Zero if not instrumented.
+    u64 BlockLivenessUs;
+    u64 RegAllocUs;
+    u64 CodeEmitUs;
+    u64 ProtectUs;
 
     JitFunction()
         : CodePtr(nullptr)
         , CodeSize(0)
         , Entry(nullptr)
+        , BlockLivenessUs(0)
+        , RegAllocUs(0)
+        , CodeEmitUs(0)
+        , ProtectUs(0)
     {}
 
     bool IsValid() const { return CodePtr != nullptr && Entry != nullptr; }
