@@ -1597,10 +1597,14 @@ public:
             }
 
             // ================================================================
-            // Fusion detection: VLOAD→VFILTER_GT→VSUM→ADDF → vectorized kernel
+            // Fusion detection: VLOAD→VFILTER_*→VSUM→ADDF → vectorized kernel
             // ================================================================
             bool fused = false;
             {
+                // VFILTER opcode to vcmppd predicate mapping:
+                // VFILTER_EQ(0xC1)→0, NE(0xC2)→12, LT(0xC3)→1, LE(0xC4)→2, GT(0xC5)→14, GE(0xC6)→13
+                static constexpr u8 kFilterPredicates[7] = {0, 0, 12, 1, 2, 14, 13}; // indexed by opcode&7
+
                 sz blen = b.end - b.start + 1;
                 if (blen >= 7) {
                     u32 r0=bytecode[b.start], r1=bytecode[b.start+1], r2=bytecode[b.start+2];
@@ -1613,8 +1617,11 @@ public:
                     u8 v4ra=(r4>>12)&0xF;
                     u8 v5ra=(r5>>12)&0xF;
 
+                    bool isFilterOp = (o1 >= 0xC1 && o1 <= 0xC6);
+                    u8 vcmpPred = isFilterOp ? kFilterPredicates[o1 & 0x7] : 0;
+
                     bool isFilterSum = (o0==static_cast<u8>(Opcode::VLOAD) &&
-                                        o1==static_cast<u8>(Opcode::VFILTER_GT) &&
+                                        isFilterOp &&
                                         o2==static_cast<u8>(Opcode::VSUM) &&
                                         o3==static_cast<u8>(Opcode::ADDF) &&
                                         o4==static_cast<u8>(Opcode::ADD) &&
@@ -1666,13 +1673,13 @@ public:
                         // Loop: 8 elements/iter, dual accumulators ymm5+ymm6
                         a.VmovupdYmmMemSib(0, static_cast<u8>(Reg64::R15),
                                             static_cast<u8>(Reg64::R8), 0);
-                        a.Vcmppd(2, 0, 4, 14);
+                        a.Vcmppd(2, 0, 4, vcmpPred);
                         a.Vpand(0, 0, 2);
                         a.Vaddpd(5, 5, 0);
 
                         a.VmovupdYmmMemSibDisp(1, static_cast<u8>(Reg64::R15),
                                                 static_cast<u8>(Reg64::R8), 0, 32);
-                        a.Vcmppd(2, 1, 4, 14);
+                        a.Vcmppd(2, 1, 4, vcmpPred);
                         a.Vpand(1, 1, 2);
                         a.Vaddpd(6, 6, 1);
 

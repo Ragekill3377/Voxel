@@ -93,14 +93,16 @@ public:
         u8 v3rd=(r3>>8)&0xF, v3rb=(r3>>16)&0xF;
         u8 v4ra=(r4>>12)&0xF, v5ra=(r5>>12)&0xF, v5rb=(r5>>16)&0xF;
         i16 jnzOff = (r6 & 0x80000000) ? static_cast<i16>(((r6>>20)&0xFFF) | 0xF000) : static_cast<i16>((r6>>20)&0xFFF);
-        if (o0==0x70 && o1==0xC5 && o2==0xD0 && o3==0x2A && o4==0x20 && o5==0x40 && o6==0x52 &&
+        bool isFilterOp = (o1 >= 0xC1 && o1 <= 0xC6);
+        if (o0==0x70 && isFilterOp && o2==0xD0 && o3==0x2A && o4==0x20 && o5==0x40 && o6==0x52 &&
             v1ra==v0rd && v2ra==v1rd && v3rb==v2rd && v4ra==v0ra && v5ra==v0ra && jnzOff == -6) {
             HasFastPath_ = true;
             FastSegId_ = (r0 >> 28) & 0xF;
             FastThreshReg_ = v1rb;
             FastAccReg_ = v3rd;
             FastOffReg_ = v0ra;
-            FastTotalReg_ = v5rb; // CMP's rb = total count reg
+            FastTotalReg_ = v5rb;
+            FastFilterMode_ = o1; // VFILTER opcode, used to determine comparison
         }
     }
 
@@ -112,10 +114,23 @@ public:
         sz offset = static_cast<sz>(ScalarAsI64(FastOffReg_));
         T acc = ScalarAsT(FastAccReg_);
         static constexpr sz kL = Engine<T>::kLanes;
+        u8 fmode = FastFilterMode_;
 
         while (offset + kL <= total) {
             T v0[kL]; for (sz i = 0; i < kL; ++i) v0[i] = data[offset + i];
-            for (sz i = 0; i < kL; ++i) v0[i] = (v0[i] > thresh) ? v0[i] : T{};
+            for (sz i = 0; i < kL; ++i) {
+                bool pass;
+                switch (fmode) {
+                case 0xC1: pass = (v0[i] == thresh); break;                // EQ
+                case 0xC2: pass = (v0[i] != thresh); break;                // NE
+                case 0xC3: pass = (v0[i] <  thresh); break;                // LT
+                case 0xC4: pass = (v0[i] <= thresh); break;                // LE
+                case 0xC5: pass = (v0[i] >  thresh); break;                // GT
+                case 0xC6: pass = (v0[i] >= thresh); break;                // GE
+                default:   pass = (v0[i] >  thresh); break;
+                }
+                v0[i] = pass ? v0[i] : T{};
+            }
             T sum = T{}; for (sz i = 0; i < kL; ++i) sum += v0[i];
             acc += sum;
             offset += kL;
@@ -319,6 +334,7 @@ private:
     u8                  FastAccReg_    = 0;
     u8                  FastOffReg_    = 1;
     u8                  FastTotalReg_  = 2;
+    u8                  FastFilterMode_ = 0xC5; // default GT
 
     enum class AggOp {
         Count, Sum, Avg, Min, Max, First, Last,
